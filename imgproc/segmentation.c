@@ -1,0 +1,1446 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 EmbedDIP
+
+#include "segmentation.h"
+
+#include "board/common.h"
+#include "core/error.h"
+#include "core/image.h"
+#include "core/memory_manager.h"
+
+#include <math.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Helper macros */
+#define MAX_ITER 10
+#define CLAMP(v, lo, hi) ((v) < (lo) ? (lo) : ((v) > (hi) ? (hi) : (v)))
+#define STACK_SIZE 65536
+
+#ifndef M_PI
+    #define M_PI 3.14159265358979323846
+#endif
+
+/* ============================= Helper Functions ============================= */
+
+/* Read pixel idx as normalized 3-vector in the *native* space.
+   HSI: [H,S,I] in [0,1]  (hue wrap handled in distance)
+   YUV: [Y,U,V] in [0,1]
+   RGB: [R,G,B] in [0,1] (RGB565 unpacked) */
+static inline void read_vec3_norm(const Image *img, int idx, float v[3])
+{
+    const uint8_t *p8 = (const uint8_t *)img->pixels;
+
+    switch (img->format) {
+    case IMAGE_FORMAT_HSI: {
+        int off = idx * 3;
+        v[0] = p8[off + 0] / 255.0f;
+        v[1] = p8[off + 1] / 255.0f;
+        v[2] = p8[off + 2] / 255.0f;
+    } break;
+
+    case IMAGE_FORMAT_YUV: {
+        int off = idx * 3;
+        v[0] = p8[off + 0] / 255.0f;
+        v[1] = p8[off + 1] / 255.0f;
+        v[2] = p8[off + 2] / 255.0f;
+    } break;
+
+    case IMAGE_FORMAT_RGB888: {
+        int off = idx * 3;
+        v[0] = p8[off + 0] / 255.0f;
+        v[1] = p8[off + 1] / 255.0f;
+        v[2] = p8[off + 2] / 255.0f;
+    } break;
+
+    case IMAGE_FORMAT_RGB565: {
+        const uint16_t *p16 = (const uint16_t *)img->pixels;
+        uint16_t px = p16[idx];
+        float r = (float)((px >> 11) & 0x1F) / 31.0f;
+        float g = (float)((px >> 5) & 0x3F) / 63.0f;
+        float b = (float)(px & 0x1F) / 31.0f;
+        v[0] = r;
+        v[1] = g;
+        v[2] = b;
+    } break;
+
+    default:
+        v[0] = v[1] = v[2] = 0.0f;
+        break;
+    }
+}
+
+/* Write a normalized 3-vector (0..1) back to the image format. */
+static inline void write_vec3_norm(Image *img, int idx, const float v[3])
+{
+    uint8_t *p8 = (uint8_t *)img->pixels;
+
+    switch (img->format) {
+    case IMAGE_FORMAT_HSI:
+    case IMAGE_FORMAT_YUV:
+    case IMAGE_FORMAT_RGB888: {
+        int off = idx * 3;
+        p8[off + 0] = (uint8_t)CLAMP((int)lrintf(v[0] * 255.0f), 0, 255);
+        p8[off + 1] = (uint8_t)CLAMP((int)lrintf(v[1] * 255.0f), 0, 255);
+        p8[off + 2] = (uint8_t)CLAMP((int)lrintf(v[2] * 255.0f), 0, 255);
+    } break;
+
+    case IMAGE_FORMAT_RGB565: {
+        uint16_t *p16 = (uint16_t *)img->pixels;
+        int r5 = CLAMP((int)lrintf(v[0] * 31.0f), 0, 31);
+        int g6 = CLAMP((int)lrintf(v[1] * 63.0f), 0, 63);
+        int b5 = CLAMP((int)lrintf(v[2] * 31.0f), 0, 31);
+        uint16_t px = (uint16_t)((r5 << 11) | (g6 << 5) | (b5));
+        p16[idx] = px;
+    } break;
+
+    default:
+        break;
+    }
+}
+
+/* Distance with special hue wrap for HSI; Euclidean otherwise.
+   a,b are normalized 0..1 vectors in native space. */
+static inline float vec_distance_native(const float a[3], const float b[3], ImageFormat fmt)
+{
+    if (fmt == IMAGE_FORMAT_HSI) {
+        float dh_raw = fabsf(a[0] - b[0]);
+        float dh = fminf(dh_raw, 1.0f - dh_raw);
+        float ds = a[1] - b[1];
+        float di = a[2] - b[2];
+        return dh * dh + ds * ds + di * di; /* squared distance (faster) */
+    } else {
+        float d0 = a[0] - b[0];
+        float d1 = a[1] - b[1];
+        float d2 = a[2] - b[2];
+        return d0 * d0 + d1 * d1 + d2 * d2; /* squared distance */
+    }
+}
+
+/* Clamp/normalize center components to [0,1] after averaging. */
+static inline void center_divide(float c[3], int cnt)
+{
+    if (cnt > 0) {
+        float inv = 1.0f / (float)cnt;
+        c[0] *= inv;
+        c[1] *= inv;
+        c[2] *= inv;
+        c[0] = fminf(fmaxf(c[0], 0.0f), 1.0f);
+        c[1] = fminf(fmaxf(c[1], 0.0f), 1.0f);
+        c[2] = fminf(fmaxf(c[2], 0.0f), 1.0f);
+    }
+}
+
+/* Distance between color vectors with special hue wrap for HSI */
+static inline float color_distance(const float a[3], const float b[3], ImageFormat fmt)
+{
+    if (fmt == IMAGE_FORMAT_HSI) {
+        /* Hue wrap-around on a[0]/b[0] assumed in [0,1] */
+        float dh_raw = fabsf(a[0] - b[0]);
+        float dh = fminf(dh_raw, 1.0f - dh_raw);
+        float ds = a[1] - b[1];
+        float di = a[2] - b[2];
+        return sqrtf(dh * dh + ds * ds + di * di);
+    } else {
+        /* Straight Euclidean in native space (already normalized 0..1) */
+        float d0 = a[0] - b[0];
+        float d1 = a[1] - b[1];
+        float d2 = a[2] - b[2];
+        return sqrtf(d0 * d0 + d1 * d1 + d2 * d2);
+    }
+}
+
+/* ============================= K-Means Segmentation ============================= */
+
+/**
+ * @brief Segments a grayscale image using K-means clustering.
+ *
+ * @param[in]  inImg   Pointer to input grayscale image.
+ * @param[out] outImg  Pointer to output segmented image.
+ * @param[in]  k       Number of clusters (e.g., 2 for foreground/background).
+ */
+embeddip_status_t grayscaleKMeans(const Image *src, Image *dst, int k)
+{
+    if (!src || !dst || !src->pixels || k <= 0) {
+        return EMBEDDIP_ERROR_INVALID_ARG;
+    }
+
+    if (isChalsEmpty(dst)) {
+        createChals(dst, 1);
+        dst->is_chals = 1;
+    }
+
+    int size = src->size;
+    const uint8_t *src_data = src->pixels;
+    float *dst_data = dst->chals->ch[0];
+
+    float *centers = (float *)memory_alloc(k * sizeof(float));
+    int *labels = (int *)memory_alloc(size * sizeof(int));
+    int *counts = (int *)memory_alloc(k * sizeof(int));
+    float *sums = (float *)memory_alloc(k * sizeof(float));
+
+    if (!centers || !labels || !counts || !sums) {
+        // Cleanup any successful allocations
+        if (centers)
+            memory_free(centers);
+        if (labels)
+            memory_free(labels);
+        if (counts)
+            memory_free(counts);
+        if (sums)
+            memory_free(sums);
+        return EMBEDDIP_ERROR_OUT_OF_MEMORY;
+    }
+
+    // Initialize cluster centers evenly spaced
+    for (int i = 0; i < k; ++i)
+        centers[i] = (255.0f / (k - 1)) * i;
+
+    for (int iter = 0; iter < MAX_ITER; ++iter) {
+        // Reset accumulators
+        for (int j = 0; j < k; ++j) {
+            counts[j] = 0;
+            sums[j] = 0.0f;
+        }
+
+        // Assign labels
+        for (int i = 0; i < size; ++i) {
+            float minDist = 1e9f;
+            int best = 0;
+
+            for (int j = 0; j < k; ++j) {
+                float dist = fabsf((float)src_data[i] - centers[j]);
+                if (dist < minDist) {
+                    minDist = dist;
+                    best = j;
+                }
+            }
+
+            // Safety clamp
+            best = CLAMP(best, 0, k - 1);
+            labels[i] = best;
+            sums[best] += (float)src_data[i];
+            counts[best]++;
+        }
+
+        // Update centers, reinitialize empty clusters
+        for (int j = 0; j < k; ++j) {
+            if (counts[j] > 0)
+                centers[j] = sums[j] / counts[j];
+            else
+                centers[j] = (float)(rand() % 256);  // reinitialize randomly
+        }
+    }
+
+    // Final image: assign cluster center as output
+    for (int i = 0; i < size; ++i) {
+        int c = CLAMP(labels[i], 0, k - 1);
+        dst_data[i] = (float)centers[c];
+    }
+
+    dst->log = IMAGE_DATA_CH0;
+
+    // Cleanup
+    memory_free(centers);
+    memory_free(labels);
+    memory_free(counts);
+    memory_free(sums);
+
+    return EMBEDDIP_OK;
+}
+
+/**
+ * @brief Segments an HSI image using K-means clustering.
+ *
+ * @param[in]  inImg   Pointer to input HSI image.
+ * @param[out] outImg  Pointer to output segmented HSI image.
+ * @param[in]  k       Number of clusters.
+ */
+embeddip_status_t colorKMeans_old(const Image *inImg, Image *outImg, int k)
+{
+    // Input validation
+    if (!inImg || !outImg) {
+        return EMBEDDIP_ERROR_NULL_PTR;
+    }
+
+    if (!inImg->pixels || !outImg->pixels) {
+        return EMBEDDIP_ERROR_NULL_PTR;
+    }
+
+    if (k <= 0 || k > 255) {
+        return EMBEDDIP_ERROR_INVALID_ARG;
+    }
+
+    // Support RGB888, HSI, and YUV (all 3-channel formats)
+    if (inImg->format != IMAGE_FORMAT_RGB888 && inImg->format != IMAGE_FORMAT_HSI &&
+        inImg->format != IMAGE_FORMAT_YUV) {
+        return EMBEDDIP_ERROR_INVALID_FORMAT;
+    }
+
+    if (outImg->format != inImg->format) {
+        return EMBEDDIP_ERROR_INVALID_FORMAT;
+    }
+
+    if (inImg->width != outImg->width || inImg->height != outImg->height) {
+        return EMBEDDIP_ERROR_INVALID_SIZE;
+    }
+
+    int size = inImg->size;
+    const uint8_t *in = (const uint8_t *)inImg->pixels;
+    uint8_t *out = (uint8_t *)outImg->pixels;
+
+    typedef struct {
+        float c0, c1, c2;  // Generic: R/H/Y, G/S/U, B/I/V
+    } color_t;
+
+    color_t *centers = (color_t *)memory_alloc(k * sizeof(color_t));
+    int *labels = (int *)memory_alloc(size * sizeof(int));
+    int *counts = (int *)memory_alloc(k * sizeof(int));
+    color_t *sums = (color_t *)memory_alloc(k * sizeof(color_t));
+
+    if (!centers || !labels || !counts || !sums) {
+        // Cleanup any successful allocations
+        if (centers)
+            memory_free(centers);
+        if (labels)
+            memory_free(labels);
+        if (counts)
+            memory_free(counts);
+        if (sums)
+            memory_free(sums);
+        return EMBEDDIP_ERROR_OUT_OF_MEMORY;
+    }
+
+    // Check if format is HSI (needs hue wraparound)
+    bool is_hsi = (inImg->format == IMAGE_FORMAT_HSI);
+
+    // Initialize cluster centers evenly spaced in third channel (I/B/V)
+    for (int i = 0; i < k; ++i) {
+        centers[i].c0 = (float)(rand() % 256);
+        centers[i].c1 = (float)(rand() % 256);
+        centers[i].c2 = (255.0f / (k - 1)) * i;
+    }
+
+    for (int iter = 0; iter < MAX_ITER; ++iter) {
+        // Reset sums and counts
+        for (int j = 0; j < k; ++j) {
+            counts[j] = 0;
+            sums[j].c0 = sums[j].c1 = sums[j].c2 = 0.0f;
+        }
+
+        // Assignment step
+        for (int i = 0; i < size; ++i) {
+            int idx = i * 3;
+            float ch0 = in[idx];
+            float ch1 = in[idx + 1];
+            float ch2 = in[idx + 2];
+
+            float minDist = 1e9f;
+            int best = 0;
+
+            for (int j = 0; j < k; ++j) {
+                float d0 = fabsf(ch0 - centers[j].c0);
+                // HSI format: wraparound hue distance for first channel
+                if (is_hsi && d0 > 128)
+                    d0 = 256 - d0;
+
+                float d1 = ch1 - centers[j].c1;
+                float d2 = ch2 - centers[j].c2;
+
+                float dist = d0 * d0 + d1 * d1 + d2 * d2;
+
+                if (dist < minDist) {
+                    minDist = dist;
+                    best = j;
+                }
+            }
+
+            labels[i] = best;
+            sums[best].c0 += ch0;
+            sums[best].c1 += ch1;
+            sums[best].c2 += ch2;
+            counts[best]++;
+        }
+
+        // Update step
+        for (int j = 0; j < k; ++j) {
+            if (counts[j] > 0) {
+                centers[j].c0 = sums[j].c0 / counts[j];
+                centers[j].c1 = sums[j].c1 / counts[j];
+                centers[j].c2 = sums[j].c2 / counts[j];
+            } else {
+                // Reinitialize empty cluster randomly
+                centers[j].c0 = (float)(rand() % 256);
+                centers[j].c1 = (float)(rand() % 256);
+                centers[j].c2 = (float)(rand() % 256);
+            }
+        }
+    }
+
+    // Final assignment - replace each pixel with its cluster center
+    for (int i = 0; i < size; ++i) {
+        int idx = i * 3;
+        int c = CLAMP(labels[i], 0, k - 1);
+
+        out[idx + 0] = (uint8_t)centers[c].c0;
+        out[idx + 1] = (uint8_t)centers[c].c1;
+        out[idx + 2] = (uint8_t)centers[c].c2;
+    }
+
+    memory_free(centers);
+    memory_free(labels);
+    memory_free(counts);
+    memory_free(sums);
+
+    return EMBEDDIP_OK;
+}
+
+/**
+ * @brief Segments an image using K-means in its native color space.
+ *
+ * @param[in]  inImg   Input image
+ * @param[out] outImg  Output segmented image (same format as input)
+ * @param[in]  k       Number of clusters (>=1, <= number of pixels)
+ */
+embeddip_status_t colorKMeans(const Image *inImg, Image *outImg, int k)
+{
+    // Input validation
+    if (!inImg || !outImg) {
+        return EMBEDDIP_ERROR_NULL_PTR;
+    }
+
+    if (!inImg->pixels || !outImg->pixels) {
+        return EMBEDDIP_ERROR_NULL_PTR;
+    }
+
+    if (k <= 0 || k > 255) {
+        return EMBEDDIP_ERROR_INVALID_ARG;
+    }
+
+    // Support RGB888, RGB565, HSI, and YUV
+    if (inImg->format != IMAGE_FORMAT_RGB888 && inImg->format != IMAGE_FORMAT_RGB565 &&
+        inImg->format != IMAGE_FORMAT_HSI && inImg->format != IMAGE_FORMAT_YUV) {
+        return EMBEDDIP_ERROR_INVALID_FORMAT;
+    }
+
+    if (inImg->format != outImg->format) {
+        return EMBEDDIP_ERROR_INVALID_FORMAT;
+    }
+
+    if (inImg->width != outImg->width || inImg->height != outImg->height) {
+        return EMBEDDIP_ERROR_INVALID_SIZE;
+    }
+
+    const int N = inImg->size;
+    if (k > N)
+        k = N;
+
+    /* Buffers */
+    int *labels = (int *)memory_alloc((size_t)N * sizeof(int));
+    int *counts = (int *)memory_alloc((size_t)k * sizeof(int));
+    float *centers = (float *)memory_alloc((size_t)k * 3 * sizeof(float)); /* k x 3 */
+    float *sums = (float *)memory_alloc((size_t)k * 3 * sizeof(float));    /* k x 3 */
+
+    if (!labels || !counts || !centers || !sums) {
+        // Cleanup any successful allocations
+        if (labels)
+            memory_free(labels);
+        if (counts)
+            memory_free(counts);
+        if (centers)
+            memory_free(centers);
+        if (sums)
+            memory_free(sums);
+        return EMBEDDIP_ERROR_OUT_OF_MEMORY;
+    }
+
+    /* --- Initialization: pick k random pixels as initial centers --- */
+    for (int j = 0; j < k; ++j) {
+        int rnd = rand() % N;
+        read_vec3_norm(inImg, rnd, &centers[3 * j]);
+        /* Ensure numeric sanity */
+        centers[3 * j + 0] = fminf(fmaxf(centers[3 * j + 0], 0.0f), 1.0f);
+        centers[3 * j + 1] = fminf(fmaxf(centers[3 * j + 1], 0.0f), 1.0f);
+        centers[3 * j + 2] = fminf(fmaxf(centers[3 * j + 2], 0.0f), 1.0f);
+    }
+
+    /* --- Iterations --- */
+    for (int iter = 0; iter < MAX_ITER; ++iter) {
+        /* reset sums/counts */
+        for (int j = 0; j < k; ++j) {
+            counts[j] = 0;
+            sums[3 * j + 0] = sums[3 * j + 1] = sums[3 * j + 2] = 0.0f;
+        }
+
+        /* assignment */
+        for (int i = 0; i < N; ++i) {
+            float v[3];
+            read_vec3_norm(inImg, i, v);
+
+            float bestD = 1e30f;
+            int bestC = 0;
+            for (int j = 0; j < k; ++j) {
+                float d = vec_distance_native(v, &centers[3 * j], inImg->format);
+                if (d < bestD) {
+                    bestD = d;
+                    bestC = j;
+                }
+            }
+            labels[i] = bestC;
+            sums[3 * bestC + 0] += v[0];
+            sums[3 * bestC + 1] += v[1];
+            sums[3 * bestC + 2] += v[2];
+            counts[bestC] += 1;
+        }
+
+        /* update */
+        for (int j = 0; j < k; ++j) {
+            if (counts[j] > 0) {
+                float c[3] = {sums[3 * j + 0], sums[3 * j + 1], sums[3 * j + 2]};
+                center_divide(c, counts[j]);
+                centers[3 * j + 0] = c[0];
+                centers[3 * j + 1] = c[1];
+                centers[3 * j + 2] = c[2];
+            } else {
+                /* empty cluster: re-seed from a random pixel */
+                int rnd = rand() % N;
+                read_vec3_norm(inImg, rnd, &centers[3 * j]);
+            }
+        }
+    }
+
+    /* --- Write result: paint each pixel with its cluster center in SAME format --- */
+    for (int i = 0; i < N; ++i) {
+        int c = CLAMP(labels[i], 0, k - 1);
+        write_vec3_norm(outImg, i, &centers[3 * c]);
+    }
+
+    memory_free(labels);
+    memory_free(counts);
+    memory_free(centers);
+    memory_free(sums);
+
+    return EMBEDDIP_OK;
+}
+
+/* ============================= Region Growing ============================= */
+
+/**
+ * @brief Segments a grayscale image using region growing with multiple seed points.
+ *
+ * @param[in]  inImg      Pointer to input grayscale image.
+ * @param[out] outImg     Pointer to output binary image (0 for background, 255 for region).
+ * @param[in]  seeds      Array of seed points.
+ * @param[in]  numSeeds   Number of seed points.
+ * @param[in]  tolerance  Intensity difference threshold for region inclusion.
+ */
+embeddip_status_t grayscaleRegionGrowing(const Image *inImg,
+                                         Image *outImg,
+                                         const Point *seeds,
+                                         int numSeeds,
+                                         uint8_t tolerance)
+{
+    // Input validation
+    if (!inImg || !outImg || !seeds) {
+        return EMBEDDIP_ERROR_NULL_PTR;
+    }
+
+    if (!inImg->pixels || !outImg->pixels) {
+        return EMBEDDIP_ERROR_NULL_PTR;
+    }
+
+    if (inImg->format != IMAGE_FORMAT_GRAYSCALE || outImg->format != IMAGE_FORMAT_GRAYSCALE) {
+        return EMBEDDIP_ERROR_INVALID_FORMAT;
+    }
+
+    if (inImg->width != outImg->width || inImg->height != outImg->height) {
+        return EMBEDDIP_ERROR_INVALID_SIZE;
+    }
+
+    if (numSeeds <= 0) {
+        return EMBEDDIP_ERROR_INVALID_ARG;
+    }
+
+    const int width = inImg->width;
+    const int height = inImg->height;
+    const uint8_t *src = inImg->pixels;
+    uint8_t *dst = outImg->pixels;
+    memset(dst, 0, inImg->size);
+
+    bool *visited = (bool *)memory_alloc(sizeof(bool) * inImg->size);
+    if (!visited) {
+        return EMBEDDIP_ERROR_OUT_OF_MEMORY;
+    }
+    memset(visited, 0, inImg->size);
+
+    Point *stack = (Point *)memory_alloc(sizeof(Point) * STACK_SIZE);
+    if (!stack) {
+        memory_free(visited);
+        return EMBEDDIP_ERROR_OUT_OF_MEMORY;
+    }
+
+    for (int s = 0; s < numSeeds; ++s) {
+        int seedX = seeds[s].x;
+        int seedY = seeds[s].y;
+        if (seedX < 0 || seedX >= width || seedY < 0 || seedY >= height)
+            continue;
+
+        int seedIndex = seedY * width + seedX;
+        if (visited[seedIndex])
+            continue;
+
+        // Run the same region growing as single-seed
+        int top = 0;
+        stack[top++] = seeds[s];
+        visited[seedIndex] = true;
+        dst[seedIndex] = 255;
+
+        long sum = src[seedIndex];
+        int count = 1;
+
+        int dx[4] = {0, -1, 1, 0};
+        int dy[4] = {-1, 0, 0, 1};
+
+        while (top > 0) {
+            Point p = stack[--top];
+            uint8_t regionMean = (uint8_t)(sum / count);
+
+            for (int i = 0; i < 4; ++i) {
+                int nx = p.x + dx[i];
+                int ny = p.y + dy[i];
+                int nidx = ny * width + nx;
+
+                if (nx >= 0 && nx < width && ny >= 0 && ny < height && !visited[nidx]) {
+                    uint8_t neighborValue = src[nidx];
+                    if (abs((int)neighborValue - (int)regionMean) <= tolerance) {
+                        visited[nidx] = true;
+                        dst[nidx] = 255;
+                        stack[top++] = (Point){nx, ny};
+
+                        sum += neighborValue;
+                        count++;
+
+                        if (top >= STACK_SIZE) {
+                            memory_free(visited);
+                            memory_free(stack);
+                            return EMBEDDIP_ERROR_OUT_OF_MEMORY;  // Stack overflow
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    memory_free(visited);
+    memory_free(stack);
+    return EMBEDDIP_OK;
+}
+
+/**
+ * @brief Performs region growing on an HSI image using color similarity.
+ *
+ * @param[in]  inImg      Pointer to input HSI image (IMAGE_FORMAT_HSI).
+ * @param[out] outMask    Pointer to output HSI image
+ * @param[in]  seedX      X coordinate of seed point.
+ * @param[in]  seedY      Y coordinate of seed point.
+ * @param[in]  tolerance  Threshold on HSI distance (e.g., 0.1–0.4 typical).
+ */
+embeddip_status_t
+colorRegionGrowing_single(const Image *inImg, Image *outImg, int seedX, int seedY, float tolerance)
+{
+    // Input validation
+    if (!inImg || !outImg) {
+        return EMBEDDIP_ERROR_NULL_PTR;
+    }
+
+    if (!inImg->pixels || !outImg->pixels) {
+        return EMBEDDIP_ERROR_NULL_PTR;
+    }
+
+    if (inImg->format != IMAGE_FORMAT_HSI || outImg->format != IMAGE_FORMAT_HSI) {
+        return EMBEDDIP_ERROR_INVALID_FORMAT;
+    }
+
+    if (inImg->width != outImg->width || inImg->height != outImg->height) {
+        return EMBEDDIP_ERROR_INVALID_SIZE;
+    }
+
+    const int width = inImg->width;
+    const int height = inImg->height;
+
+    // Validate seed coordinates
+    if (seedX < 0 || seedX >= width || seedY < 0 || seedY >= height) {
+        return EMBEDDIP_ERROR_INVALID_ARG;
+    }
+
+    const uint8_t *src = (const uint8_t *)inImg->pixels;
+    uint8_t *dst = (uint8_t *)outImg->pixels;
+
+    memset(dst, 0, inImg->size * 3);  // Set all HSI values in output to 0 (black)
+
+    bool *visited = (bool *)memory_alloc(sizeof(bool) * inImg->size);
+    if (!visited) {
+        return EMBEDDIP_ERROR_OUT_OF_MEMORY;
+    }
+    memset(visited, 0, inImg->size);
+
+    Point *stack = (Point *)memory_alloc(sizeof(Point) * STACK_SIZE);
+    if (!stack) {
+        memory_free(visited);
+        return EMBEDDIP_ERROR_OUT_OF_MEMORY;
+    }
+    int top = 0;
+
+    int seedIndex = seedY * width + seedX;
+    float h0 = src[seedIndex * 3] / 255.0f;
+    float s0 = src[seedIndex * 3 + 1] / 255.0f;
+    float i0 = src[seedIndex * 3 + 2] / 255.0f;
+
+    stack[top++] = (Point){seedX, seedY};
+    visited[seedIndex] = true;
+
+    // Copy seed pixel to output
+    dst[seedIndex * 3] = src[seedIndex * 3];
+    dst[seedIndex * 3 + 1] = src[seedIndex * 3 + 1];
+    dst[seedIndex * 3 + 2] = src[seedIndex * 3 + 2];
+
+    const int dx[4] = {0, -1, 1, 0};
+    const int dy[4] = {-1, 0, 0, 1};
+
+    while (top > 0) {
+        Point p = stack[--top];
+
+        for (int d = 0; d < 4; ++d) {
+            int nx = p.x + dx[d];
+            int ny = p.y + dy[d];
+            int nidx = ny * width + nx;
+
+            if (nx >= 0 && nx < width && ny >= 0 && ny < height && !visited[nidx]) {
+                float h = src[nidx * 3] / 255.0f;
+                float s = src[nidx * 3 + 1] / 255.0f;
+                float ii = src[nidx * 3 + 2] / 255.0f;
+
+                // Hue distance with wraparound
+                float dh = fminf(fabsf(h - h0), 1.0f - fabsf(h - h0));
+                float ds = s - s0;
+                float di = ii - i0;
+
+                float dist = sqrtf(dh * dh + ds * ds + di * di);
+
+                if (dist <= tolerance) {
+                    visited[nidx] = true;
+
+                    // Copy pixel to output
+                    dst[nidx * 3] = src[nidx * 3];
+                    dst[nidx * 3 + 1] = src[nidx * 3 + 1];
+                    dst[nidx * 3 + 2] = src[nidx * 3 + 2];
+
+                    stack[top++] = (Point){nx, ny};
+
+                    if (top >= STACK_SIZE) {
+                        memory_free(visited);
+                        memory_free(stack);
+                        return EMBEDDIP_ERROR_OUT_OF_MEMORY;  // Stack overflow
+                    }
+                }
+            }
+        }
+    }
+
+    memory_free(visited);
+    memory_free(stack);
+    return EMBEDDIP_OK;
+}
+
+/**
+ * @brief Performs region growing using color similarity with multiple seeds.
+ *
+ * @param[in]  inImg      Pointer to input image.
+ * @param[out] outImg     Pointer to output binary mask (1-channel).
+ * @param[in]  seeds      Array of seed points.
+ * @param[in]  numSeeds   Number of seed points.
+ * @param[in]  tolerance  Threshold on color distance.
+ */
+embeddip_status_t colorRegionGrowing(const Image *inImg,
+                                     Image *outImg,
+                                     const Point *seeds,
+                                     int numSeeds,
+                                     float tolerance)
+{
+    // Input validation
+    if (!inImg || !outImg || !seeds) {
+        return EMBEDDIP_ERROR_NULL_PTR;
+    }
+
+    if (!inImg->pixels || !outImg->pixels) {
+        return EMBEDDIP_ERROR_NULL_PTR;
+    }
+
+    bool outputColorful = (outImg->format == IMAGE_FORMAT_RGB888);
+
+    if (!outputColorful && outImg->format != IMAGE_FORMAT_GRAYSCALE) {
+        return EMBEDDIP_ERROR_INVALID_FORMAT;
+    }
+
+    if (!outputColorful && outImg->depth != 1) {
+        return EMBEDDIP_ERROR_INVALID_FORMAT;
+    }
+
+    if (inImg->width != outImg->width || inImg->height != outImg->height) {
+        return EMBEDDIP_ERROR_INVALID_SIZE;
+    }
+
+    if (numSeeds <= 0) {
+        return EMBEDDIP_ERROR_INVALID_ARG;
+    }
+
+    const int width = inImg->width;
+    const int height = inImg->height;
+    const int outDepth = outputColorful ? 3 : 1;
+    const uint8_t *inData = (const uint8_t *)inImg->pixels;
+    const int inDepth = inImg->depth;
+
+    uint8_t *outData = (uint8_t *)outImg->pixels;
+    /* Clear output */
+    memset(outImg->pixels, 0, (size_t)(outImg->size * outDepth));
+
+    /* Allocate visited */
+    bool *visited = (bool *)memory_alloc((size_t)inImg->size * sizeof(bool));
+    if (!visited) {
+        return EMBEDDIP_ERROR_OUT_OF_MEMORY;
+    }
+
+    /* Allocate stack */
+    Point *stack = (Point *)memory_alloc((size_t)STACK_SIZE * sizeof(Point));
+    if (!stack) {
+        memory_free(visited);
+        return EMBEDDIP_ERROR_OUT_OF_MEMORY;
+    }
+
+    const int dx[4] = {0, -1, 1, 0};
+    const int dy[4] = {-1, 0, 0, 1};
+
+    for (int s = 0; s < numSeeds; ++s) {
+        int seedX = seeds[s].x;
+        int seedY = seeds[s].y;
+
+        if ((unsigned)seedX >= (unsigned)width || (unsigned)seedY >= (unsigned)height)
+            continue;
+
+        const int seedIndex = seedY * width + seedX;
+
+        memset(visited, 0, (size_t)inImg->size * sizeof(bool));
+
+        float seedVec[3];
+        read_vec3_norm(inImg, seedIndex, seedVec);
+
+        int top = 0;
+        stack[top++] = (Point){seedX, seedY};
+        visited[seedIndex] = true;
+        if (outputColorful) {
+            for (int c = 0; c < 3; ++c) {
+                outData[seedIndex * 3 + c] = inData[seedIndex * inDepth + c];
+            }
+        } else {
+            outData[seedIndex] = 255;
+        }
+
+        while (top > 0) {
+            Point p = stack[--top];
+
+            for (int d = 0; d < 4; ++d) {
+                int nx = p.x + dx[d];
+                int ny = p.y + dy[d];
+
+                if ((unsigned)nx >= (unsigned)width || (unsigned)ny >= (unsigned)height)
+                    continue;
+
+                int nidx = ny * width + nx;
+                if (visited[nidx])
+                    continue;
+
+                float v[3];
+                read_vec3_norm(inImg, nidx, v);
+
+                float dist = color_distance(v, seedVec, inImg->format);
+                if (dist <= tolerance) {
+                    visited[nidx] = true;
+                    if (outputColorful) {
+                        for (int c = 0; c < 3; ++c) {
+                            outData[nidx * 3 + c] = inData[nidx * inDepth + c];
+                        }
+                    } else {
+                        outData[nidx] = 255;
+                    }
+
+                    if (top >= STACK_SIZE) {
+                        memory_free(visited);
+                        memory_free(stack);
+                        return EMBEDDIP_ERROR_OUT_OF_MEMORY;  // Stack overflow
+                    }
+                    stack[top++] = (Point){nx, ny};
+                }
+            }
+        }
+    }
+
+    memory_free(visited);
+    memory_free(stack);
+    return EMBEDDIP_OK;
+}
+
+/* ============================= GrabCut Segmentation ============================= */
+
+#define FOREGROUND 255
+#define BACKGROUND 0
+#define GMM_COMPONENTS 2
+#define MAX_ITER_GRABCUT 5
+
+typedef struct {
+    float weight;
+    float mean;
+    float variance;
+} GMMComponent;
+
+static float gaussian_prob(float x, float mean, float var)
+{
+    float diff = x - mean;
+    return (1.0f / sqrtf(2.0f * M_PI * var)) * expf(-(diff * diff) / (2.0f * var));
+}
+
+embeddip_status_t grabCutLite_working(const Image *src, Image *mask, Rectangle roi, int iterations)
+{
+    const int size = src->width * src->height;
+    const uint8_t *img1 = src->pixels;
+    uint8_t *mask_data = (uint8_t *)mask->pixels;
+
+    for (int iter = 0; iter < iterations; ++iter) {
+        uint32_t fgSum = 0, fgCount = 0;
+        uint32_t bgSum = 0, bgCount = 0;
+
+        // Step 1: Compute foreground and background means
+        for (int i = 0; i < size; ++i) {
+            if (mask_data[i] == 2) {
+                fgSum += img1[i];
+                fgCount++;
+            } else if (mask_data[i] == 0) {
+                bgSum += img1[i];
+                bgCount++;
+            }
+        }
+
+        // Fallback if no foreground was found (bootstrap)
+        if (fgCount == 0) {
+            for (int i = 0; i < size; ++i) {
+                if (mask_data[i] == 1) {
+                    fgSum += img1[i];
+                    fgCount++;
+                }
+            }
+        }
+
+        if (fgCount == 0 || bgCount == 0)
+            break;  // Not enough info to proceed
+
+        uint8_t fgMean = fgSum / fgCount;
+        uint8_t bgMean = bgSum / bgCount;
+
+        // Debug
+        // printf("Iter %d: fgMean=%d, bgMean=%d\n", iter, fgMean, bgMean);
+
+        // Step 2: Update probable region
+        for (int i = 0; i < size; ++i) {
+            if (mask_data[i] == 1) {
+                int distFg = abs((int)img1[i] - (int)fgMean);
+                int distBg = abs((int)img1[i] - (int)bgMean);
+
+                // Reclassify as closer to fg or bg
+                if (distFg < distBg)
+                    mask_data[i] = 2;  // Becomes foreground
+                else
+                    mask_data[i] = 0;  // Becomes background
+            }
+        }
+    }
+    return EMBEDDIP_OK;
+}
+
+embeddip_status_t grabCutLitesd(const Image *src, Image *mask, Rectangle roi, int iterations)
+{
+    const int size = src->width * src->height;
+    const uint8_t *inImg_pixels = src->pixels;
+    uint8_t *mask_data = (uint8_t *)mask->pixels;
+
+    for (int iter = 0; iter < iterations; ++iter) {
+        uint32_t fgSum = 0, fgCount = 0;
+        uint32_t bgSum = 0, bgCount = 0;
+
+        // Step 1: Compute foreground and background means
+        for (int i = 0; i < size; ++i) {
+            if (mask_data[i] == 2) {
+                fgSum += inImg_pixels[i];
+                fgCount++;
+            } else if (mask_data[i] == 0) {
+                bgSum += inImg_pixels[i];
+                bgCount++;
+            }
+        }
+
+        // Fallback if no foreground was found (bootstrap)
+        if (fgCount == 0) {
+            for (int i = 0; i < size; ++i) {
+                if (mask_data[i] == 1) {
+                    fgSum += inImg_pixels[i];
+                    fgCount++;
+                }
+            }
+        }
+
+        if (fgCount == 0 || bgCount == 0)
+            break;  // Not enough info to proceed
+
+        uint8_t fgMean = fgSum / fgCount;
+        uint8_t bgMean = bgSum / bgCount;
+
+        // Debug
+        // printf("Iter %d: fgMean=%d, bgMean=%d\n", iter, fgMean, bgMean);
+
+        return EMBEDDIP_OK;
+        // Step 2: Update probable region
+        for (int i = 0; i < size; ++i) {
+            if (mask_data[i] == 1) {
+                int distFg = abs((int)inImg_pixels[i] - (int)fgMean);
+                int distBg = abs((int)inImg_pixels[i] - (int)bgMean);
+
+                // Reclassify as closer to fg or bg
+                if (distFg < distBg)
+                    mask_data[i] = 2;  // Becomes foreground
+                else
+                    mask_data[i] = 0;  // Becomes background
+            }
+        }
+    }
+    return EMBEDDIP_OK;
+}
+
+/**
+ * @brief Performs a simplified GrabCut-inspired segmentation on a grayscale image using a
+ * rectangular ROI.
+ *
+ * @param[in]  inImg      Input grayscale image.
+ * @param[out] outImg     Output binary image (0 = background, 255 = foreground).
+ * @param[in]  roi        Rectangleangular region of interest.
+ * @param[in]  iterations Number of refinement iterations.
+ */
+embeddip_status_t grabCutLite(const Image *src, Image *mask, Rectangle roi, int iterations)
+{
+    // Input validation
+    if (!src || !mask) {
+        return EMBEDDIP_ERROR_NULL_PTR;
+    }
+
+    if (!src->pixels || !mask->pixels) {
+        return EMBEDDIP_ERROR_NULL_PTR;
+    }
+
+    if (src->format != IMAGE_FORMAT_GRAYSCALE) {
+        return EMBEDDIP_ERROR_INVALID_FORMAT;
+    }
+
+    if (mask->format != IMAGE_FORMAT_MASK && mask->format != IMAGE_FORMAT_GRAYSCALE) {
+        return EMBEDDIP_ERROR_INVALID_FORMAT;
+    }
+
+    if (src->width != mask->width || src->height != mask->height) {
+        return EMBEDDIP_ERROR_INVALID_SIZE;
+    }
+
+    if (iterations <= 0) {
+        return EMBEDDIP_ERROR_INVALID_ARG;
+    }
+
+    const int width = src->width;
+    const int height = src->height;
+    const int size = width * height;
+    const uint8_t *src_data = src->pixels;
+    uint8_t *dst = mask->pixels;
+
+    // Temporary mask: 0 = background, 1 = probable, 2 = foreground
+    uint8_t *temp_mask = (uint8_t *)memory_alloc(size);
+    if (!temp_mask) {
+        return EMBEDDIP_ERROR_OUT_OF_MEMORY;
+    }
+
+    // Initialize mask: ROI = probable, rest = background
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int idx = y * width + x;
+            if (x >= roi.x && x < (roi.x + roi.width) && y >= roi.y && y < (roi.y + roi.height)) {
+                temp_mask[idx] = 1;  // Probable
+            } else {
+                temp_mask[idx] = 0;  // Background
+            }
+        }
+    }
+
+    // Iterative refinement
+    for (int iter = 0; iter < iterations; ++iter) {
+        uint32_t fgSum = 0, fgCount = 0;
+        uint32_t bgSum = 0, bgCount = 0;
+
+        // Compute FG/BG means based on confirmed pixels
+        for (int i = 0; i < size; ++i) {
+            if (temp_mask[i] == 2)  // FG
+            {
+                fgSum += src_data[i];
+                fgCount++;
+            } else if (temp_mask[i] == 0)  // BG
+            {
+                bgSum += src_data[i];
+                bgCount++;
+            }
+        }
+
+        // Bootstrap: if no FG yet, use probable region for FG stats
+        if (fgCount == 0) {
+            for (int i = 0; i < size; ++i) {
+                if (temp_mask[i] == 1) {
+                    fgSum += src_data[i];
+                    fgCount++;
+                }
+            }
+        }
+
+        if (fgCount == 0 || bgCount == 0)
+            break;
+
+        uint8_t fgMean = (uint8_t)(fgSum / fgCount);
+        uint8_t bgMean = (uint8_t)(bgSum / bgCount);
+
+        // Reset ROI pixels back to "probable" each iteration
+        for (int y = roi.y; y < roi.y + roi.height; ++y) {
+            for (int x = roi.x; x < roi.x + roi.width; ++x) {
+                int idx = y * width + x;
+                temp_mask[idx] = 1;
+            }
+        }
+
+        // Reclassify probable pixels based on updated means
+        for (int i = 0; i < size; ++i) {
+            if (temp_mask[i] == 1) {
+                int dFg = abs((int)src_data[i] - (int)fgMean);
+                int dBg = abs((int)src_data[i] - (int)bgMean);
+                temp_mask[i] = (dFg < dBg) ? 2 : 0;
+            }
+        }
+    }
+
+    // Final binary output mask
+    for (int i = 0; i < size; ++i) {
+        dst[i] = (temp_mask[i] == 2) ? 255 : 0;
+    }
+
+    memory_free(temp_mask);
+    mask->log = IMAGE_DATA_PIXELS;
+    return EMBEDDIP_OK;
+}
+
+embeddip_status_t
+grabCutGrayscaleRealistic(const Image *src, Image *mask, Rectangle roi, int max_iter)
+{
+    if (!src || !mask || !src->pixels || src->format != IMAGE_FORMAT_GRAYSCALE)
+        return EMBEDDIP_ERROR_NULL_PTR;
+
+    int width = src->width;
+    int height = src->height;
+    int size = width * height;
+    const uint8_t *src_data = (const uint8_t *)src->pixels;
+    uint8_t *mask_data = (uint8_t *)mask->pixels;
+
+    // Allocate component responsibilities
+    uint8_t *labels = (uint8_t *)memory_alloc(size * sizeof(uint8_t));  // 0=BG, 1=FG
+    float(*fg_resp)[GMM_COMPONENTS] =
+        (float(*)[GMM_COMPONENTS])memory_alloc(size * GMM_COMPONENTS * sizeof(float));
+    float(*bg_resp)[GMM_COMPONENTS] =
+        (float(*)[GMM_COMPONENTS])memory_alloc(size * GMM_COMPONENTS * sizeof(float));
+
+    GMMComponent fg_gmm[GMM_COMPONENTS];
+    GMMComponent bg_gmm[GMM_COMPONENTS];
+
+    // Step 1: Initialize mask from ROI
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int idx = y * width + x;
+            if (x >= roi.x && x < roi.x + roi.width && y >= roi.y && y < roi.y + roi.height) {
+                mask_data[idx] = FOREGROUND;
+                labels[idx] = 1;
+            } else {
+                mask_data[idx] = BACKGROUND;
+                labels[idx] = 0;
+            }
+        }
+    }
+
+    // Step 2: Initialize GMMs with 2 components
+    for (int i = 0; i < GMM_COMPONENTS; ++i) {
+        fg_gmm[i].mean = 50.0f + 100 * i;
+        fg_gmm[i].variance = 500.0f;
+        fg_gmm[i].weight = 0.5f;
+
+        bg_gmm[i].mean = 50.0f + 100 * i;
+        bg_gmm[i].variance = 500.0f;
+        bg_gmm[i].weight = 0.5f;
+    }
+
+    // Step 3: EM Iterations
+    for (int iter = 0; iter < max_iter; ++iter) {
+        // E-Step: compute responsibilities
+        for (int i = 0; i < size; ++i) {
+            float x = (float)src_data[i];
+            float total_fg = 0.0f, total_bg = 0.0f;
+
+            // Foreground responsibilities
+            for (int c = 0; c < GMM_COMPONENTS; ++c) {
+                fg_resp[i][c] =
+                    fg_gmm[c].weight * gaussian_prob(x, fg_gmm[c].mean, fg_gmm[c].variance);
+                total_fg += fg_resp[i][c];
+            }
+            for (int c = 0; c < GMM_COMPONENTS; ++c)
+                fg_resp[i][c] /= (total_fg + 1e-6f);
+
+            // Background responsibilities
+            for (int c = 0; c < GMM_COMPONENTS; ++c) {
+                bg_resp[i][c] =
+                    bg_gmm[c].weight * gaussian_prob(x, bg_gmm[c].mean, bg_gmm[c].variance);
+                total_bg += bg_resp[i][c];
+            }
+            for (int c = 0; c < GMM_COMPONENTS; ++c)
+                bg_resp[i][c] /= (total_bg + 1e-6f);
+        }
+
+        // M-Step: update GMM parameters
+        for (int c = 0; c < GMM_COMPONENTS; ++c) {
+            // FG
+            float w_sum = 0.0f, x_sum = 0.0f, x2_sum = 0.0f;
+            for (int i = 0; i < size; ++i) {
+                if (labels[i] == 1) {
+                    float r = fg_resp[i][c];
+                    float x = (float)src_data[i];
+                    w_sum += r;
+                    x_sum += r * x;
+                    x2_sum += r * x * x;
+                }
+            }
+            if (w_sum > 1e-6f) {
+                fg_gmm[c].weight = w_sum;
+                fg_gmm[c].mean = x_sum / w_sum;
+                fg_gmm[c].variance =
+                    fmaxf((x2_sum / w_sum) - fg_gmm[c].mean * fg_gmm[c].mean, 10.0f);
+            }
+
+            // BG
+            w_sum = x_sum = x2_sum = 0.0f;
+            for (int i = 0; i < size; ++i) {
+                if (labels[i] == 0) {
+                    float r = bg_resp[i][c];
+                    float x = (float)src_data[i];
+                    w_sum += r;
+                    x_sum += r * x;
+                    x2_sum += r * x * x;
+                }
+            }
+            if (w_sum > 1e-6f) {
+                bg_gmm[c].weight = w_sum;
+                bg_gmm[c].mean = x_sum / w_sum;
+                bg_gmm[c].variance =
+                    fmaxf((x2_sum / w_sum) - bg_gmm[c].mean * bg_gmm[c].mean, 10.0f);
+            }
+        }
+
+        // Normalize GMM weights
+        float fg_total = 0.0f, bg_total = 0.0f;
+        for (int c = 0; c < GMM_COMPONENTS; ++c) {
+            fg_total += fg_gmm[c].weight;
+            bg_total += bg_gmm[c].weight;
+        }
+        for (int c = 0; c < GMM_COMPONENTS; ++c) {
+            fg_gmm[c].weight /= fg_total;
+            bg_gmm[c].weight /= bg_total;
+        }
+
+        // Reassign labels
+        for (int i = 0; i < size; ++i) {
+            float x = (float)src_data[i];
+            float p_fg = 0.0f, p_bg = 0.0f;
+            for (int c = 0; c < GMM_COMPONENTS; ++c) {
+                p_fg += fg_gmm[c].weight * gaussian_prob(x, fg_gmm[c].mean, fg_gmm[c].variance);
+                p_bg += bg_gmm[c].weight * gaussian_prob(x, bg_gmm[c].mean, bg_gmm[c].variance);
+            }
+            labels[i] = (p_fg > p_bg) ? 1 : 0;
+            mask_data[i] = labels[i] ? FOREGROUND : BACKGROUND;
+        }
+    }
+
+    memory_free(labels);
+    memory_free(fg_resp);
+    memory_free(bg_resp);
+    return EMBEDDIP_OK;
+}
+
+typedef struct {
+    float weight;
+    float mean[3];      // [R, G, B]
+    float variance[3];  // diagonal covariance
+} GMMComponentRGB;
+
+float gaussian_prob_rgb(const uint8_t *pixel, const GMMComponentRGB *comp)
+{
+    float prob = 1.0f;
+    for (int i = 0; i < 3; ++i) {
+        float diff = (float)pixel[i] - comp->mean[i];
+        float var = comp->variance[i];
+        prob *= (1.0f / sqrtf(2.0f * M_PI * var)) * expf(-diff * diff / (2.0f * var));
+    }
+    return prob;
+}
+
+embeddip_status_t grabCutRGB(const Image *src, Image *mask, Rectangle roi, int max_iter)
+{
+    if (!src || !mask || !src->pixels || src->format != IMAGE_FORMAT_RGB888)
+        return EMBEDDIP_ERROR_NULL_PTR;
+
+    int width = src->width;
+    int height = src->height;
+    int size = width * height;
+    const uint8_t *src_data = (const uint8_t *)src->pixels;
+    uint8_t *mask_data = (uint8_t *)mask->pixels;
+
+    // Allocate label buffer (0 = BG, 1 = FG)
+    uint8_t *labels = (uint8_t *)memory_alloc(size * sizeof(uint8_t));
+    float(*fg_resp)[GMM_COMPONENTS] =
+        (float(*)[GMM_COMPONENTS])memory_alloc(size * GMM_COMPONENTS * sizeof(float));
+    float(*bg_resp)[GMM_COMPONENTS] =
+        (float(*)[GMM_COMPONENTS])memory_alloc(size * GMM_COMPONENTS * sizeof(float));
+
+    GMMComponentRGB fg_gmm[GMM_COMPONENTS];
+    GMMComponentRGB bg_gmm[GMM_COMPONENTS];
+
+    // Step 1: Initial Labeling from ROI
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int idx = y * width + x;
+            if (x >= roi.x && x < roi.x + roi.width && y >= roi.y && y < roi.y + roi.height) {
+                mask_data[idx] = FOREGROUND;
+                labels[idx] = 1;
+            } else {
+                mask_data[idx] = BACKGROUND;
+                labels[idx] = 0;
+            }
+        }
+    }
+
+    // Step 2: Init GMMs
+    for (int c = 0; c < GMM_COMPONENTS; ++c) {
+        for (int ch = 0; ch < 3; ++ch) {
+            fg_gmm[c].mean[ch] = 100.0f + 50 * c;
+            fg_gmm[c].variance[ch] = 1000.0f;
+            bg_gmm[c].mean[ch] = 50.0f + 100 * c;
+            bg_gmm[c].variance[ch] = 1000.0f;
+        }
+        fg_gmm[c].weight = 0.5f;
+        bg_gmm[c].weight = 0.5f;
+    }
+
+    // Step 3: EM Iterations
+    for (int iter = 0; iter < max_iter; ++iter) {
+        // E-Step: compute responsibilities
+        for (int i = 0; i < size; ++i) {
+            const uint8_t *px = &src_data[i * 3];
+            float total_fg = 0.0f, total_bg = 0.0f;
+
+            for (int c = 0; c < GMM_COMPONENTS; ++c) {
+                fg_resp[i][c] = fg_gmm[c].weight * gaussian_prob_rgb(px, &fg_gmm[c]);
+                bg_resp[i][c] = bg_gmm[c].weight * gaussian_prob_rgb(px, &bg_gmm[c]);
+                total_fg += fg_resp[i][c];
+                total_bg += bg_resp[i][c];
+            }
+            for (int c = 0; c < GMM_COMPONENTS; ++c) {
+                fg_resp[i][c] /= (total_fg + 1e-6f);
+                bg_resp[i][c] /= (total_bg + 1e-6f);
+            }
+        }
+
+        // M-Step: update GMM parameters
+        for (int c = 0; c < GMM_COMPONENTS; ++c) {
+            float fg_wsum = 0.0f, bg_wsum = 0.0f;
+            float fg_sum[3] = {0}, fg_sqsum[3] = {0};
+            float bg_sum[3] = {0}, bg_sqsum[3] = {0};
+
+            for (int i = 0; i < size; ++i) {
+                const uint8_t *px = &src_data[i * 3];
+                if (labels[i] == 1) {
+                    float r = fg_resp[i][c];
+                    fg_wsum += r;
+                    for (int ch = 0; ch < 3; ++ch) {
+                        fg_sum[ch] += r * px[ch];
+                        fg_sqsum[ch] += r * px[ch] * px[ch];
+                    }
+                } else {
+                    float r = bg_resp[i][c];
+                    bg_wsum += r;
+                    for (int ch = 0; ch < 3; ++ch) {
+                        bg_sum[ch] += r * px[ch];
+                        bg_sqsum[ch] += r * px[ch] * px[ch];
+                    }
+                }
+            }
+
+            for (int ch = 0; ch < 3; ++ch) {
+                if (fg_wsum > 1e-6f) {
+                    fg_gmm[c].mean[ch] = fg_sum[ch] / fg_wsum;
+                    float var = (fg_sqsum[ch] / fg_wsum) - fg_gmm[c].mean[ch] * fg_gmm[c].mean[ch];
+                    fg_gmm[c].variance[ch] = fmaxf(var, 10.0f);
+                }
+
+                if (bg_wsum > 1e-6f) {
+                    bg_gmm[c].mean[ch] = bg_sum[ch] / bg_wsum;
+                    float var = (bg_sqsum[ch] / bg_wsum) - bg_gmm[c].mean[ch] * bg_gmm[c].mean[ch];
+                    bg_gmm[c].variance[ch] = fmaxf(var, 10.0f);
+                }
+            }
+
+            fg_gmm[c].weight = fg_wsum;
+            bg_gmm[c].weight = bg_wsum;
+        }
+
+        // Normalize weights
+        float fg_total = 0.0f, bg_total = 0.0f;
+        for (int c = 0; c < GMM_COMPONENTS; ++c) {
+            fg_total += fg_gmm[c].weight;
+            bg_total += bg_gmm[c].weight;
+        }
+        for (int c = 0; c < GMM_COMPONENTS; ++c) {
+            fg_gmm[c].weight /= (fg_total + 1e-6f);
+            bg_gmm[c].weight /= (bg_total + 1e-6f);
+        }
+
+        // Reassign labels and update mask
+        for (int i = 0; i < size; ++i) {
+            const uint8_t *px = &src_data[i * 3];
+            float p_fg = 0.0f, p_bg = 0.0f;
+            for (int c = 0; c < GMM_COMPONENTS; ++c) {
+                p_fg += fg_gmm[c].weight * gaussian_prob_rgb(px, &fg_gmm[c]);
+                p_bg += bg_gmm[c].weight * gaussian_prob_rgb(px, &bg_gmm[c]);
+            }
+            labels[i] = (p_fg > p_bg) ? 1 : 0;
+            mask_data[i] = labels[i] ? FOREGROUND : BACKGROUND;
+        }
+    }
+
+    memory_free(labels);
+    memory_free(fg_resp);
+    memory_free(bg_resp);
+    return EMBEDDIP_OK;
+}

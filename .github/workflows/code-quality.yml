@@ -1,0 +1,79 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Analysis Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cppcheck clang-format
+
+      - name: Run Cppcheck
+        run: |
+          echo "Running cppcheck static analysis..."
+          cppcheck \
+            --enable=warning,style,performance,portability \
+            --error-exitcode=1 \
+            --inline-suppr \
+            --suppress=missingIncludeSystem \
+            --suppress=unusedFunction \
+            --suppress=unmatchedSuppression \
+            --std=c11 \
+            --force \
+            -I embedDIP/core \
+            -I embedDIP/imgproc \
+            -I embedDIP/board \
+            -I embedDIP/device \
+            -I embedDIP/wrapper \
+            -I Drivers/STM32F7xx_HAL_Driver/Inc \
+            -I Drivers/CMSIS/Device/ST/STM32F7xx/Include \
+            -I Drivers/CMSIS/Core/Include \
+            -I Core/Inc \
+            embedDIP/ Core/ \
+            --xml \
+            2> cppcheck-report.xml
+
+      - name: Check Code Formatting
+        run: |
+          echo "Checking code formatting..."
+
+          if [ ! -f .clang-format ]; then
+            cat > .clang-format << 'FMT'
+          ---
+          BasedOnStyle: LLVM
+          IndentWidth: 4
+          ColumnLimit: 100
+          PointerAlignment: Left
+          AllowShortIfStatementsOnASingleLine: false
+          AllowShortFunctionsOnASingleLine: Empty
+          IndentCaseLabels: true
+          BreakBeforeBraces: Allman
+          FMT
+          fi
+
+          # Fail if any file is not properly formatted
+          find embedDIP Core \( -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.hpp" \) \
+            -not -path "*/Drivers/*" \
+            -print0 | xargs -0 clang-format --dry-run --Werror
+
+      - name: Upload Cppcheck Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cppcheck-report
+          path: cppcheck-report.xml
+          retention-days: 30
+          if-no-files-found: warn

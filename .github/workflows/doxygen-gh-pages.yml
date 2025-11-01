@@ -1,0 +1,81 @@
+name: Build and Deploy Doxygen Documentation
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '**/*.h'
+      - '**/*.hpp'
+      - '**/*.c'
+      - '**/*.cpp'
+      - 'Doxyfile'
+      - '.github/workflows/doxygen-gh-pages.yml'
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build-docs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Doxygen and Graphviz
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y doxygen graphviz
+
+      - name: Verify Doxygen installation
+        run: |
+          doxygen --version
+          dot -V
+
+      - name: Generate Doxygen documentation
+        run: |
+          doxygen Doxyfile
+
+      - name: Check generated documentation
+        run: |
+          if [ ! -f "docs/html/index.html" ]; then
+            echo "ERROR: Documentation not generated!"
+            exit 1
+          fi
+          echo "Documentation generated successfully!"
+          ls -lh docs/html/
+
+      - name: Create .nojekyll file
+        run: |
+          touch docs/html/.nojekyll
+          echo "embedDIP Documentation" > docs/html/README.md
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/html
+
+  deploy:
+    needs: build-docs
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
