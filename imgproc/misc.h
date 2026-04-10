@@ -38,14 +38,16 @@ embeddip_status_t normalize(Image *img);
 embeddip_status_t convertTo(Image *img);
 
 /**
- * @brief Compute distance between images
+ * @brief Computes the color distance of each pixel in an RGB image to a given reference color.
  *
- * @param src1 First input image
- * @param src2 Second input image
- * @param dst Output distance
+ * @param inImg Pointer to the input RGB image (3 channels, interleaved as RGBRGB...)
+ * @param outImg Pointer to the output grayscale image (1 channel, same width and height as input)
+ * @param R_ref Reference Red channel value (0–255)
+ * @param G_ref Reference Green channel value (0–255)
+ * @param B_ref Reference Blue channel value (0–255)
  * @return EMBEDDIP_OK on success, error code on failure
  */
-embeddip_status_t dist(const Image *src1, const Image *src2, Image *dst);
+embeddip_status_t dist(const Image *inImg, Image *outImg, uint8_t R_ref, uint8_t G_ref, uint8_t B_ref);
 
 /**
  * @brief Bitwise AND operation on binary masks

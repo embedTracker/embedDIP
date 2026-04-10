@@ -571,18 +571,10 @@ void Image::add(const Image &other, Image &out) const
 }
 
 /**
- * @brief Computes distance between two images.
- * Note: C API changed - now computes distance between two images.
+ * @brief Computes color distance from this RGB image to a reference color.
  */
-void Image::dist(Image &out, uint8_t r, uint8_t g, uint8_t b) const
-{
-    // TODO: C API signature changed to dist(src1, src2, dst)
-    // This wrapper needs to be updated or deprecated
-    (void)r;
-    (void)g;
-    (void)b;  // Suppress unused warnings
-    // For now, compute distance between this image and itself (placeholder)
-    ::dist(raw(), raw(), out.raw());
+void Image::dist(Image &out, uint8_t r, uint8_t g, uint8_t b) const {
+  ::dist(raw(), out.raw(), r, g, b);
 }
 
 /**

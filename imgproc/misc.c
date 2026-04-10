@@ -320,68 +320,60 @@ embeddip_status_t convertTo(Image *img)
 }
 
 /**
- * @brief Compute distance between images
+ * @brief Computes the color distance of each pixel in an RGB
+ * image to a given reference color.
  *
- * @param src1 First input image
- * @param src2 Second input image
- * @param dst Output distance
+ * @param[in] inImg Pointer to the input RGB image (3 channels, interleaved as RGBRGB...).
+ * @param[out] outImg Pointer to the output grayscale image (1 channel, same width and height as input).
+ * @param[in] R_ref Reference Red channel value (0–255).
+ * @param[in] G_ref Reference Green channel value (0–255).
+ * @param[in] B_ref Reference Blue channel value (0–255).
  * @return EMBEDDIP_OK on success, error code on failure
  */
-embeddip_status_t dist(const Image *src1, const Image *src2, Image *dst)
+embeddip_status_t dist(const Image *inImg, Image *outImg, uint8_t R_ref, uint8_t G_ref, uint8_t B_ref)
 {
-    if (!src1 || !src2 || !dst)
-        return EMBEDDIP_ERROR_NULL_PTR;
+    int totalPixels = inImg->width * inImg->height;
 
-    if (src1->width != src2->width || src1->height != src2->height)
-        return EMBEDDIP_ERROR_INVALID_SIZE;
-
-    if (src1->format != src2->format)
-        return EMBEDDIP_ERROR_INVALID_FORMAT;
-
-    int totalPixels = src1->width * src1->height;
-
-    if (isChalsEmpty(dst)) {
-        createChals(dst, dst->depth);
-        dst->is_chals = 1;
+    if (isChalsEmpty(outImg)) {
+        createChals(outImg, outImg->depth);
+        outImg->is_chals = 1;
     }
 
-    if (src1->log == IMAGE_DATA_PIXELS && src2->log == IMAGE_DATA_PIXELS) {
-        uint8_t *src1_data = (uint8_t *)src1->pixels;
-        uint8_t *src2_data = (uint8_t *)src2->pixels;
+    if (inImg->log == IMAGE_DATA_PIXELS) {
+        // Raw byte access
+        uint8_t *inData = (uint8_t *)inImg->pixels;
 
-        if (src1->format == IMAGE_FORMAT_GRAYSCALE) {
-            // Grayscale distance
-            for (int i = 0; i < totalPixels; ++i) {
-                float diff = (float)src1_data[i] - (float)src2_data[i];
-                dst->chals->ch[0][i] = sqrtf(diff * diff);
-            }
-        } else if (src1->format == IMAGE_FORMAT_RGB888) {
-            // RGB distance
-            for (int i = 0; i < totalPixels; ++i) {
-                int idx = i * 3;
-                float R_diff = (float)src1_data[idx] - (float)src2_data[idx];
-                float G_diff = (float)src1_data[idx + 1] - (float)src2_data[idx + 1];
-                float B_diff = (float)src1_data[idx + 2] - (float)src2_data[idx + 2];
-                dst->chals->ch[0][i] = sqrtf(R_diff * R_diff + G_diff * G_diff + B_diff * B_diff);
-            }
+        for (int i = 0; i < totalPixels; ++i) {
+            int idx = i * 3;
+            uint8_t R = inData[idx];
+            uint8_t G = inData[idx + 1];
+            uint8_t B = inData[idx + 2];
+
+            float d = sqrtf((R - R_ref) * (R - R_ref) + (G - G_ref) * (G - G_ref) +
+                            (B - B_ref) * (B - B_ref));
+
+            outImg->chals->ch[0][i] = d;
         }
     } else {
-        // Channel-based distance computation
-        if (isChalsEmpty(src1)) {
-            createChals((Image *)src1, src1->depth);
-        }
-        if (isChalsEmpty(src2)) {
-            createChals((Image *)src2, src2->depth);
+        // Channel access (float-based) - RGB is in ch[1], ch[2], ch[3]
+        if (isChalsEmpty(inImg)) {
+            createChals((Image *)inImg, inImg->depth);
         }
 
-        // Assuming grayscale or single channel
+        float *R_ch = inImg->chals->ch[1];
+        float *G_ch = inImg->chals->ch[2];
+        float *B_ch = inImg->chals->ch[3];
+
         for (int i = 0; i < totalPixels; ++i) {
-            float diff = src1->chals->ch[0][i] - src2->chals->ch[0][i];
-            dst->chals->ch[0][i] = sqrtf(diff * diff);
+            float d = sqrtf((R_ch[i] - R_ref) * (R_ch[i] - R_ref) +
+                            (G_ch[i] - G_ref) * (G_ch[i] - G_ref) +
+                            (B_ch[i] - B_ref) * (B_ch[i] - B_ref));
+
+            outImg->chals->ch[0][i] = d;
         }
     }
 
-    dst->log = IMAGE_DATA_CH0;
+    outImg->log = IMAGE_DATA_CH0;
     return EMBEDDIP_OK;
 }
 
