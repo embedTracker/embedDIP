@@ -317,24 +317,27 @@ embeddip_status_t convertScaleAbs(const Image *src, Image *dst, float alpha, flo
 /**
  * @brief Applies piecewise linear transformation.
  *
- * @param[in]  src        Pointer to input image.
- * @param[out] dst        Pointer to output image.
- * @param[in]  in_min     Input minimum value.
- * @param[in]  in_max     Input maximum value.
- * @param[in]  out_min    Output minimum value.
- * @param[in]  out_max    Output maximum value.
+ * @param[in]  src           Pointer to input image.
+ * @param[out] dst           Pointer to output image.
+ * @param[in]  breakpoints   Array of input breakpoint values (must be sorted).
+ * @param[in]  values        Array of output values corresponding to breakpoints.
+ * @param[in]  num_points    Number of points in breakpoints/values arrays.
  * @return EMBEDDIP_OK on success, error code otherwise.
  */
 embeddip_status_t piecewiseTransform(const Image *src,
                                      Image *dst,
-                                     uint8_t in_min,
-                                     uint8_t in_max,
-                                     uint8_t out_min,
-                                     uint8_t out_max)
+                                     const uint8_t *breakpoints,
+                                     const uint8_t *values,
+                                     int num_points)
 {
     if (src->depth != 1) {
         // Only GRAYSCALE is supported
         return EMBEDDIP_ERROR_INVALID_FORMAT;
+    }
+
+    if (num_points < 2) {
+        // Need at least 2 points for a valid transformation
+        return EMBEDDIP_ERROR_INVALID_ARG;
     }
 
     if (isChalsEmpty(src)) {
@@ -352,21 +355,36 @@ embeddip_status_t piecewiseTransform(const Image *src,
 
     for (int i = 0; i < total_pixels; ++i) {
         uint8_t pixel = src_data[i];
+        float output_value;
 
-        // Handle out-of-range pixels
-        if (pixel <= in_min) {
-            dst_data[i] = out_min / 255.0f;
-        } else if (pixel >= in_max) {
-            dst_data[i] = out_max / 255.0f;
-        } else {
-            // Linear interpolation between (in_min, out_min) and (in_max, out_max)
-            float x0 = in_min;
-            float x1 = in_max;
-            float y0 = out_min / 255.0f;
-            float y1 = out_max / 255.0f;
-
-            dst_data[i] = y0 + ((pixel - x0) * (y1 - y0)) / (x1 - x0);
+        // Handle pixels below the first breakpoint
+        if (pixel <= breakpoints[0]) {
+            output_value = values[0] / 255.0f;
         }
+        // Handle pixels above the last breakpoint
+        else if (pixel >= breakpoints[num_points - 1]) {
+            output_value = values[num_points - 1] / 255.0f;
+        }
+        // Find the segment and interpolate
+        else {
+            int segment = 0;
+            for (int j = 0; j < num_points - 1; ++j) {
+                if (pixel >= breakpoints[j] && pixel <= breakpoints[j + 1]) {
+                    segment = j;
+                    break;
+                }
+            }
+
+            // Linear interpolation within the segment
+            float x0 = breakpoints[segment];
+            float x1 = breakpoints[segment + 1];
+            float y0 = values[segment] / 255.0f;
+            float y1 = values[segment + 1] / 255.0f;
+
+            output_value = y0 + ((pixel - x0) * (y1 - y0)) / (x1 - x0);
+        }
+
+        dst_data[i] = output_value;
     }
 
     dst->log = IMAGE_DATA_CH0;

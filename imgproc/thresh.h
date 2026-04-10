@@ -80,20 +80,18 @@ embeddip_status_t convertScaleAbs(const Image *src, Image *dst, float alpha, flo
 /**
  * @brief Applies piecewise linear transformation.
  *
- * @param[in]  src        Pointer to input image.
- * @param[out] dst        Pointer to output image.
- * @param[in]  in_min     Input minimum value.
- * @param[in]  in_max     Input maximum value.
- * @param[in]  out_min    Output minimum value.
- * @param[in]  out_max    Output maximum value.
+ * @param[in]  src           Pointer to input image.
+ * @param[out] dst           Pointer to output image.
+ * @param[in]  breakpoints   Array of input breakpoint values (must be sorted).
+ * @param[in]  values        Array of output values corresponding to breakpoints.
+ * @param[in]  num_points    Number of points in breakpoints/values arrays.
  * @return EMBEDDIP_OK on success, error code otherwise.
  */
 embeddip_status_t piecewiseTransform(const Image *src,
                                      Image *dst,
-                                     uint8_t in_min,
-                                     uint8_t in_max,
-                                     uint8_t out_min,
-                                     uint8_t out_max);
+                                     const uint8_t *breakpoints,
+                                     const uint8_t *values,
+                                     int num_points);
 
 #ifdef __cplusplus
 }

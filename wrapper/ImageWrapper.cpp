@@ -360,11 +360,9 @@ void Image::piecewiseTransform(Image &out,
                                const std::vector<uint8_t> &breakpoints,
                                const std::vector<uint8_t> &values) const noexcept
 {
-    // Note: C API expects 4 range values (in_min, in_max, out_min, out_max)
-    // For now, use simple mapping if vectors have exactly 2 elements
-    if (breakpoints.size() >= 2 && values.size() >= 2) {
+    if (breakpoints.size() == values.size() && breakpoints.size() > 0) {
         ::piecewiseTransform(
-            raw(), out.raw(), breakpoints[0], breakpoints[1], values[0], values[1]);
+            raw(), out.raw(), breakpoints.data(), values.data(), breakpoints.size());
     }
 }
 
