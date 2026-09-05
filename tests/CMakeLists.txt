@@ -54,6 +54,10 @@ add_executable(embeddip_test_cv_tracker_particle test_cv_tracker_particle.c)
 target_link_libraries(embeddip_test_cv_tracker_particle PRIVATE embedDIP)
 add_test(NAME embeddip.cv_tracker_particle COMMAND embeddip_test_cv_tracker_particle)
 
+add_executable(embeddip_test_cv_tracker_meanshift test_cv_tracker_meanshift.c)
+target_link_libraries(embeddip_test_cv_tracker_meanshift PRIVATE embedDIP)
+add_test(NAME embeddip.cv_tracker_meanshift COMMAND embeddip_test_cv_tracker_meanshift)
+
 add_executable(embeddip_test_runtime test_runtime.c)
 target_link_libraries(embeddip_test_runtime PRIVATE embedDIP)
 add_test(NAME embeddip.runtime COMMAND embeddip_test_runtime)
