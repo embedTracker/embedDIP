@@ -42,6 +42,10 @@ add_executable(embeddip_test_cv_tracker_kalman test_cv_tracker_kalman.c)
 target_link_libraries(embeddip_test_cv_tracker_kalman PRIVATE embedDIP)
 add_test(NAME embeddip.cv_tracker_kalman COMMAND embeddip_test_cv_tracker_kalman)
 
+add_executable(embeddip_test_cv_tracker_template test_cv_tracker_template.c)
+target_link_libraries(embeddip_test_cv_tracker_template PRIVATE embedDIP)
+add_test(NAME embeddip.cv_tracker_template COMMAND embeddip_test_cv_tracker_template)
+
 add_executable(embeddip_test_runtime test_runtime.c)
 target_link_libraries(embeddip_test_runtime PRIVATE embedDIP)
 add_test(NAME embeddip.runtime COMMAND embeddip_test_runtime)
