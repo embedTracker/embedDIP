@@ -4,18 +4,16 @@
 #include "cv/tracker_template.h"
 
 #include <stdint.h>
+#include <string.h>
 
-static bool template_format_ok(ImageFormat fmt)
-{
-    return fmt == IMAGE_FORMAT_GRAYSCALE || fmt == IMAGE_FORMAT_MASK;
-}
+#include "cv/image_gray.h"
 
 embeddip_status_t cv_template_set(CvTemplateState *state, const ImageView *src, Rectangle roi)
 {
     if (state == NULL || src == NULL || src->pixels == NULL) {
         return EMBEDDIP_ERROR_NULL_PTR;
     }
-    if (!template_format_ok(src->format)) {
+    if (!cv_format_is_gray(src->format)) {
         return EMBEDDIP_ERROR_INVALID_FORMAT;
     }
     if (roi.width <= 0 || roi.height <= 0 || (uint32_t)roi.width > CV_TEMPLATE_MAX_WIDTH ||
@@ -29,9 +27,7 @@ embeddip_status_t cv_template_set(CvTemplateState *state, const ImageView *src, 
 
     for (int32_t row = 0; row < roi.height; ++row) {
         const uint8_t *src_row = src->pixels + (size_t)(roi.y + row) * src->row_stride_bytes;
-        for (int32_t col = 0; col < roi.width; ++col) {
-            state->patch[row][col] = src_row[roi.x + col];
-        }
+        memcpy(state->patch[row], src_row + roi.x, (size_t)roi.width);
     }
 
     state->width = (uint16_t)roi.width;
@@ -41,8 +37,10 @@ embeddip_status_t cv_template_set(CvTemplateState *state, const ImageView *src, 
 }
 
 /* Sum of absolute differences between the stored patch and a frame region. */
-static uint32_t template_sad_at(const CvTemplateState *state, const ImageView *frame,
-                                int32_t origin_x, int32_t origin_y)
+static uint32_t template_sad_at(const CvTemplateState *state,
+                                const ImageView *frame,
+                                int32_t origin_x,
+                                int32_t origin_y)
 {
     uint32_t sad = 0u;
     for (uint16_t row = 0u; row < state->height; ++row) {
@@ -56,8 +54,8 @@ static uint32_t template_sad_at(const CvTemplateState *state, const ImageView *f
     return sad;
 }
 
-embeddip_status_t cv_template_match(const CvTemplateState *state, const ImageView *frame,
-                                     Rectangle *out_box)
+embeddip_status_t
+cv_template_match(const CvTemplateState *state, const ImageView *frame, Rectangle *out_box)
 {
     if (state == NULL || frame == NULL || out_box == NULL || frame->pixels == NULL) {
         return EMBEDDIP_ERROR_NULL_PTR;

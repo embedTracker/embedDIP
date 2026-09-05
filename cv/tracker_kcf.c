@@ -3,16 +3,13 @@
 
 #include "cv/tracker_kcf.h"
 
-#include <stdint.h>
-#include <string.h>
-
 #include "board/common.h"
 #include "imgproc/fft.h"
 
-static bool kcf_format_ok(ImageFormat fmt)
-{
-    return fmt == IMAGE_FORMAT_GRAYSCALE || fmt == IMAGE_FORMAT_MASK;
-}
+#include <stdint.h>
+#include <string.h>
+
+#include "cv/image_gray.h"
 
 /* Crop and nearest-neighbor resample a src region to
  * CV_KCF_PATCH_SIZE x CV_KCF_PATCH_SIZE, writing into a heap Image's
@@ -32,12 +29,12 @@ static void kcf_extract_patch(const ImageView *src, Rectangle roi, uint8_t *out_
 
 /* Build a heap Image holding a CV_KCF_PATCH_SIZE^2 grayscale patch sampled
  * from src's roi. Caller must deleteImage() the result. */
-static embeddip_status_t kcf_make_patch_image(const ImageView *src, Rectangle roi,
-                                               Image **out_patch)
+static embeddip_status_t
+kcf_make_patch_image(const ImageView *src, Rectangle roi, Image **out_patch)
 {
     Image *patch = NULL;
-    embeddip_status_t status =
-        createImageWH((int)CV_KCF_PATCH_SIZE, (int)CV_KCF_PATCH_SIZE, IMAGE_FORMAT_GRAYSCALE, &patch);
+    embeddip_status_t status = createImageWH(
+        (int)CV_KCF_PATCH_SIZE, (int)CV_KCF_PATCH_SIZE, IMAGE_FORMAT_GRAYSCALE, &patch);
     if (status != EMBEDDIP_OK) {
         return status;
     }
@@ -96,28 +93,6 @@ static void kcf_conj_multiply(const Image *search_spec, const Image *template_sp
 /* Find the index of the largest real correlation value, then convert its
  * circular position into a signed (dx,dy) pixel offset in patch space
  * (values in [0, N/2) map to positive offsets, [N/2, N) wrap to negative). */
-/* Build a box_width x box_height roi centered at (cx,cy), clamped to stay
- * inside frame bounds (same clamp policy cv_kcf_update already applies to
- * its search roi). */
-static Rectangle kcf_clamped_roi(int32_t cx, int32_t cy, int32_t box_width, int32_t box_height,
-                                  const ImageView *frame)
-{
-    Rectangle roi = {cx - box_width / 2, cy - box_height / 2, box_width, box_height};
-    if (roi.x < 0) {
-        roi.x = 0;
-    }
-    if (roi.y < 0) {
-        roi.y = 0;
-    }
-    if ((uint32_t)(roi.x + roi.width) > frame->width) {
-        roi.x = (int32_t)frame->width - roi.width;
-    }
-    if ((uint32_t)(roi.y + roi.height) > frame->height) {
-        roi.y = (int32_t)frame->height - roi.height;
-    }
-    return roi;
-}
-
 static void kcf_find_peak_offset(const Image *corr_time, int32_t *out_dx, int32_t *out_dy)
 {
     uint32_t n = corr_time->width;
@@ -142,7 +117,7 @@ embeddip_status_t cv_kcf_init(CvKcfState *state, const ImageView *src, Rectangle
     if (state == NULL || src == NULL || src->pixels == NULL) {
         return EMBEDDIP_ERROR_NULL_PTR;
     }
-    if (!kcf_format_ok(src->format)) {
+    if (!cv_format_is_gray(src->format)) {
         return EMBEDDIP_ERROR_INVALID_FORMAT;
     }
     if (roi.width <= 0 || roi.height <= 0 || roi.x < 0 || roi.y < 0 ||
@@ -160,8 +135,8 @@ embeddip_status_t cv_kcf_init(CvKcfState *state, const ImageView *src, Rectangle
     }
 
     Image *spectrum = NULL;
-    status = createImageWH((int)CV_KCF_PATCH_SIZE, (int)CV_KCF_PATCH_SIZE, IMAGE_FORMAT_GRAYSCALE,
-                            &spectrum);
+    status = createImageWH(
+        (int)CV_KCF_PATCH_SIZE, (int)CV_KCF_PATCH_SIZE, IMAGE_FORMAT_GRAYSCALE, &spectrum);
     if (status != EMBEDDIP_OK) {
         deleteImage(patch);
         return status;
@@ -178,30 +153,42 @@ embeddip_status_t cv_kcf_init(CvKcfState *state, const ImageView *src, Rectangle
     /* Preallocate every per-frame scratch buffer cv_kcf_update will reuse
      * (see CvKcfState doc comment). On any failure below, release whatever
      * was already allocated (including template_spectrum above) and bail. */
-    status = createImageWH((int)CV_KCF_PATCH_SIZE, (int)CV_KCF_PATCH_SIZE, IMAGE_FORMAT_GRAYSCALE,
-                            &state->search_patch);
+    status = createImageWH((int)CV_KCF_PATCH_SIZE,
+                           (int)CV_KCF_PATCH_SIZE,
+                           IMAGE_FORMAT_GRAYSCALE,
+                           &state->search_patch);
     if (status == EMBEDDIP_OK) {
-        status = createImageWH((int)CV_KCF_PATCH_SIZE, (int)CV_KCF_PATCH_SIZE,
-                                IMAGE_FORMAT_GRAYSCALE, &state->search_spectrum);
+        status = createImageWH((int)CV_KCF_PATCH_SIZE,
+                               (int)CV_KCF_PATCH_SIZE,
+                               IMAGE_FORMAT_GRAYSCALE,
+                               &state->search_spectrum);
     }
     if (status == EMBEDDIP_OK) {
-        status = createImageWH((int)CV_KCF_PATCH_SIZE, (int)CV_KCF_PATCH_SIZE,
-                                IMAGE_FORMAT_GRAYSCALE, &state->corr_spectrum);
+        status = createImageWH((int)CV_KCF_PATCH_SIZE,
+                               (int)CV_KCF_PATCH_SIZE,
+                               IMAGE_FORMAT_GRAYSCALE,
+                               &state->corr_spectrum);
     }
     if (status == EMBEDDIP_OK) {
         status = createChalsComplex(state->corr_spectrum, 2u);
     }
     if (status == EMBEDDIP_OK) {
-        status = createImageWH((int)CV_KCF_PATCH_SIZE, (int)CV_KCF_PATCH_SIZE,
-                                IMAGE_FORMAT_GRAYSCALE, &state->corr_time);
+        status = createImageWH((int)CV_KCF_PATCH_SIZE,
+                               (int)CV_KCF_PATCH_SIZE,
+                               IMAGE_FORMAT_GRAYSCALE,
+                               &state->corr_time);
     }
     if (status == EMBEDDIP_OK) {
-        status = createImageWH((int)CV_KCF_PATCH_SIZE, (int)CV_KCF_PATCH_SIZE,
-                                IMAGE_FORMAT_GRAYSCALE, &state->adapt_patch);
+        status = createImageWH((int)CV_KCF_PATCH_SIZE,
+                               (int)CV_KCF_PATCH_SIZE,
+                               IMAGE_FORMAT_GRAYSCALE,
+                               &state->adapt_patch);
     }
     if (status == EMBEDDIP_OK) {
-        status = createImageWH((int)CV_KCF_PATCH_SIZE, (int)CV_KCF_PATCH_SIZE,
-                                IMAGE_FORMAT_GRAYSCALE, &state->adapt_spectrum);
+        status = createImageWH((int)CV_KCF_PATCH_SIZE,
+                               (int)CV_KCF_PATCH_SIZE,
+                               IMAGE_FORMAT_GRAYSCALE,
+                               &state->adapt_spectrum);
     }
     if (status != EMBEDDIP_OK) {
         cv_kcf_free(state);
@@ -225,12 +212,16 @@ embeddip_status_t cv_kcf_update(CvKcfState *state, const ImageView *frame, Recta
     if (!state->initialized) {
         return EMBEDDIP_ERROR_NOT_INITIALIZED;
     }
-    if (!kcf_format_ok(frame->format)) {
+    if (!cv_format_is_gray(frame->format)) {
         return EMBEDDIP_ERROR_INVALID_FORMAT;
     }
 
-    Rectangle search_roi =
-        kcf_clamped_roi(state->center_x, state->center_y, state->box_width, state->box_height, frame);
+    Rectangle search_roi = cv_clamp_centered_box(state->center_x,
+                                                 state->center_y,
+                                                 state->box_width,
+                                                 state->box_height,
+                                                 frame->width,
+                                                 frame->height);
 
     /* All buffers below are preallocated once by cv_kcf_init and reused
      * every frame (see CvKcfState doc comment) — no create/delete here, so
@@ -263,8 +254,12 @@ embeddip_status_t cv_kcf_update(CvKcfState *state, const ImageView *frame, Recta
     state->center_y = search_roi.y + search_roi.height / 2 + offset_y;
 
     if (state->learn_rate > 0.0f) {
-        Rectangle new_roi = kcf_clamped_roi(state->center_x, state->center_y, state->box_width,
-                                             state->box_height, frame);
+        Rectangle new_roi = cv_clamp_centered_box(state->center_x,
+                                                  state->center_y,
+                                                  state->box_width,
+                                                  state->box_height,
+                                                  frame->width,
+                                                  frame->height);
 
         kcf_extract_patch(frame, new_roi, (uint8_t *)state->adapt_patch->pixels);
         status = fft(state->adapt_patch, state->adapt_spectrum);
@@ -296,8 +291,12 @@ embeddip_status_t cv_kcf_free(CvKcfState *state)
     }
 
     Image **owned[] = {
-        &state->template_spectrum, &state->search_patch,    &state->search_spectrum,
-        &state->corr_spectrum,     &state->corr_time,       &state->adapt_patch,
+        &state->template_spectrum,
+        &state->search_patch,
+        &state->search_spectrum,
+        &state->corr_spectrum,
+        &state->corr_time,
+        &state->adapt_patch,
         &state->adapt_spectrum,
     };
     for (size_t i = 0u; i < sizeof(owned) / sizeof(owned[0]); ++i) {

@@ -29,8 +29,11 @@ static uint8_t hog_pixel_clamped(const ImageView *src, int32_t px, int32_t py)
 }
 
 /* Accumulate a single cell's 9-bin orientation histogram. */
-static void hog_cell_histogram(const ImageView *src, int32_t cell_x0, int32_t cell_y0,
-                               uint16_t cell_size, float hist[CV_HOG_BINS])
+static void hog_cell_histogram(const ImageView *src,
+                               int32_t cell_x0,
+                               int32_t cell_y0,
+                               uint16_t cell_size,
+                               float hist[CV_HOG_BINS])
 {
     const float bin_width = CV_HOG_PI / (float)CV_HOG_BINS;
     uint16_t cy;
@@ -71,8 +74,10 @@ static void hog_cell_histogram(const ImageView *src, int32_t cell_x0, int32_t ce
     }
 }
 
-static embeddip_status_t hog_geometry(Rectangle roi, const CvHogConfig *config,
-                                      size_t *cells_x, size_t *cells_y,
+static embeddip_status_t hog_geometry(Rectangle roi,
+                                      const CvHogConfig *config,
+                                      size_t *cells_x,
+                                      size_t *cells_y,
                                       size_t *out_length)
 {
     size_t cx;
@@ -114,8 +119,8 @@ static embeddip_status_t hog_geometry(Rectangle roi, const CvHogConfig *config,
     return EMBEDDIP_OK;
 }
 
-embeddip_status_t cv_hog_descriptor_size(Rectangle roi, const CvHogConfig *config,
-                                         size_t *out_length)
+embeddip_status_t
+cv_hog_descriptor_size(Rectangle roi, const CvHogConfig *config, size_t *out_length)
 {
     size_t cells_x;
     size_t cells_y;
@@ -126,15 +131,17 @@ embeddip_status_t cv_hog_descriptor_size(Rectangle roi, const CvHogConfig *confi
     return hog_geometry(roi, config, &cells_x, &cells_y, out_length);
 }
 
-embeddip_status_t cv_hog_extract(const ImageView *src, Rectangle roi,
-                                 const CvHogConfig *config, float *descriptor,
-                                 size_t descriptor_capacity, size_t *out_length)
+embeddip_status_t cv_hog_extract(const ImageView *src,
+                                 Rectangle roi,
+                                 const CvHogConfig *config,
+                                 float *descriptor,
+                                 size_t descriptor_capacity,
+                                 size_t *out_length)
 {
     embeddip_status_t status;
     size_t cells_x;
     size_t cells_y;
     size_t length;
-    size_t blocks_x;
     size_t out = 0u;
     size_t by;
 
@@ -150,17 +157,13 @@ embeddip_status_t cv_hog_extract(const ImageView *src, Rectangle roi,
         return status;
     }
     /* ROI must lie inside the image. */
-    if (roi.x < 0 || roi.y < 0 ||
-        (int64_t)roi.x + (int64_t)roi.width > (int64_t)src->width ||
+    if (roi.x < 0 || roi.y < 0 || (int64_t)roi.x + (int64_t)roi.width > (int64_t)src->width ||
         (int64_t)roi.y + (int64_t)roi.height > (int64_t)src->height) {
         return EMBEDDIP_ERROR_OUT_OF_RANGE;
     }
     if (descriptor_capacity < length) {
         return EMBEDDIP_ERROR_INVALID_SIZE;
     }
-
-    blocks_x = cells_x - (CV_HOG_BLOCK_CELLS - 1u);
-    (void)blocks_x;
 
     for (by = 0u; by + CV_HOG_BLOCK_CELLS <= cells_y; ++by) {
         size_t bx;
@@ -176,12 +179,9 @@ embeddip_status_t cv_hog_extract(const ImageView *src, Rectangle roi,
             /* Gather the 2x2 cell histograms of this block, row-major. */
             for (r = 0u; r < CV_HOG_BLOCK_CELLS; ++r) {
                 for (c = 0u; c < CV_HOG_BLOCK_CELLS; ++c) {
-                    int32_t cell_x0 =
-                        roi.x + (int32_t)((bx + c) * config->cell_size);
-                    int32_t cell_y0 =
-                        roi.y + (int32_t)((by + r) * config->cell_size);
-                    hog_cell_histogram(src, cell_x0, cell_y0, config->cell_size,
-                                       &block[idx]);
+                    int32_t cell_x0 = roi.x + (int32_t)((bx + c) * config->cell_size);
+                    int32_t cell_y0 = roi.y + (int32_t)((by + r) * config->cell_size);
+                    hog_cell_histogram(src, cell_x0, cell_y0, config->cell_size, &block[idx]);
                     idx += CV_HOG_BINS;
                 }
             }

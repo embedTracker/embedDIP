@@ -5,16 +5,19 @@
 
 #include <math.h>
 
+#include "cv/image_gray.h"
+
 /** Default mode-seek iteration cap; converges well within this for the
  * shift magnitudes expected between consecutive frames. */
 #define CV_MEANSHIFT_DEFAULT_MAX_ITERS 5u
 
 static bool is_supported_format(const ImageView *img)
 {
-    bool is_gray = (img->format == IMAGE_FORMAT_GRAYSCALE || img->format == IMAGE_FORMAT_MASK) &&
-                   img->depth == IMAGE_DEPTH_U8;
-    bool is_rgb565 = img->format == IMAGE_FORMAT_RGB565 && img->depth == IMAGE_DEPTH_U16;
-    return is_gray || is_rgb565;
+    if (!cv_format_is_gray_or_rgb565(img->format)) {
+        return false;
+    }
+    return cv_format_is_gray(img->format) ? img->depth == IMAGE_DEPTH_U8
+                                          : img->depth == IMAGE_DEPTH_U16;
 }
 
 /** Grayscale/mask bin index for pixel (x,y); uses cv/track_hist's mapping. */
@@ -39,19 +42,9 @@ embeddip_status_t cv_meanshift_init(CvMeanShiftState *state, const ImageView *fr
     /* Clamp roi to frame bounds first, matching cv_hist_build's own clamp,
      * so the stored box geometry always matches the region the histogram
      * was built over (and always fits inside the frame). */
-    int32_t x0 = roi.x < 0 ? 0 : roi.x;
-    int32_t y0 = roi.y < 0 ? 0 : roi.y;
-    int32_t x1 = roi.x + roi.width;
-    int32_t y1 = roi.y + roi.height;
-    if (x1 > (int32_t)frame->width) x1 = (int32_t)frame->width;
-    if (y1 > (int32_t)frame->height) y1 = (int32_t)frame->height;
-    if (x1 <= x0 || y1 <= y0) {
+    if (!cv_clamp_roi(roi, frame->width, frame->height, &roi)) {
         return EMBEDDIP_ERROR_INVALID_SIZE;
     }
-    roi.x = x0;
-    roi.y = y0;
-    roi.width = x1 - x0;
-    roi.height = y1 - y0;
 
     embeddip_status_t st = cv_hist_build(frame, roi, state->template_hist, &state->hist_nbins);
     if (st != EMBEDDIP_OK) {
@@ -67,8 +60,8 @@ embeddip_status_t cv_meanshift_init(CvMeanShiftState *state, const ImageView *fr
     return EMBEDDIP_OK;
 }
 
-embeddip_status_t cv_meanshift_update(CvMeanShiftState *state, const ImageView *frame,
-                                       Rectangle *out_box)
+embeddip_status_t
+cv_meanshift_update(CvMeanShiftState *state, const ImageView *frame, Rectangle *out_box)
 {
     if (state == NULL || frame == NULL || out_box == NULL) {
         return EMBEDDIP_ERROR_NULL_PTR;
@@ -80,7 +73,7 @@ embeddip_status_t cv_meanshift_update(CvMeanShiftState *state, const ImageView *
         return EMBEDDIP_ERROR_INVALID_FORMAT;
     }
 
-    bool is_gray = (frame->format == IMAGE_FORMAT_GRAYSCALE || frame->format == IMAGE_FORMAT_MASK);
+    bool is_gray = cv_format_is_gray(frame->format);
     int32_t hw = state->box_width / 2;
     int32_t hh = state->box_height / 2;
     /* ponytail: search box padded to 2x the tracked box so a shift of up to
@@ -94,10 +87,14 @@ embeddip_status_t cv_meanshift_update(CvMeanShiftState *state, const ImageView *
         int32_t sy0 = state->center_y - search_hh;
         int32_t sx1 = state->center_x + search_hw;
         int32_t sy1 = state->center_y + search_hh;
-        if (sx0 < 0) sx0 = 0;
-        if (sy0 < 0) sy0 = 0;
-        if (sx1 > (int32_t)frame->width) sx1 = (int32_t)frame->width;
-        if (sy1 > (int32_t)frame->height) sy1 = (int32_t)frame->height;
+        if (sx0 < 0)
+            sx0 = 0;
+        if (sy0 < 0)
+            sy0 = 0;
+        if (sx1 > (int32_t)frame->width)
+            sx1 = (int32_t)frame->width;
+        if (sy1 > (int32_t)frame->height)
+            sy1 = (int32_t)frame->height;
 
         double sum_x = 0.0, sum_y = 0.0, sum_w = 0.0;
         for (int32_t y = sy0; y < sy1; y++) {
@@ -139,10 +136,14 @@ embeddip_status_t cv_meanshift_update(CvMeanShiftState *state, const ImageView *
     }
 
     /* Clamp so the box stays inside the frame. */
-    if (state->center_x - hw < 0) state->center_x = hw;
-    if (state->center_y - hh < 0) state->center_y = hh;
-    if (state->center_x + hw > (int32_t)frame->width) state->center_x = (int32_t)frame->width - hw;
-    if (state->center_y + hh > (int32_t)frame->height) state->center_y = (int32_t)frame->height - hh;
+    if (state->center_x - hw < 0)
+        state->center_x = hw;
+    if (state->center_y - hh < 0)
+        state->center_y = hh;
+    if (state->center_x + hw > (int32_t)frame->width)
+        state->center_x = (int32_t)frame->width - hw;
+    if (state->center_y + hh > (int32_t)frame->height)
+        state->center_y = (int32_t)frame->height - hh;
 
     out_box->x = state->center_x - hw;
     out_box->y = state->center_y - hh;

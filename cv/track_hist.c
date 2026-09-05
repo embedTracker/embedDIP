@@ -7,38 +7,36 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "cv/image_gray.h"
+
 /** Bhattacharyya exponent scale; tuned so identical hists -> >0.99 and
  * disjoint hists -> <0.8 (see tests/test_cv_track_hist.c). */
 #define CV_HIST_BHATTA_K 5.0f
 
-embeddip_status_t cv_hist_build(const ImageView *img, Rectangle roi, float *out,
-                                 uint32_t *out_nbins)
+embeddip_status_t
+cv_hist_build(const ImageView *img, Rectangle roi, float *out, uint32_t *out_nbins)
 {
     if (img == NULL || out == NULL || out_nbins == NULL) {
         return EMBEDDIP_ERROR_NULL_PTR;
     }
 
-    bool is_gray = (img->format == IMAGE_FORMAT_GRAYSCALE || img->format == IMAGE_FORMAT_MASK) &&
-                   img->depth == IMAGE_DEPTH_U8;
-    bool is_rgb565 = img->format == IMAGE_FORMAT_RGB565 && img->depth == IMAGE_DEPTH_U16;
-    if (!is_gray && !is_rgb565) {
+    if (!cv_format_is_gray_or_rgb565(img->format)) {
+        return EMBEDDIP_ERROR_INVALID_FORMAT;
+    }
+    bool is_gray = cv_format_is_gray(img->format);
+    if (img->depth != (is_gray ? IMAGE_DEPTH_U8 : IMAGE_DEPTH_U16)) {
         return EMBEDDIP_ERROR_INVALID_FORMAT;
     }
 
     /* Clamp roi to image bounds. */
-    int32_t x0 = roi.x < 0 ? 0 : roi.x;
-    int32_t y0 = roi.y < 0 ? 0 : roi.y;
-    int32_t x1 = roi.x + roi.width;
-    int32_t y1 = roi.y + roi.height;
-    if (x1 > (int32_t)img->width) {
-        x1 = (int32_t)img->width;
-    }
-    if (y1 > (int32_t)img->height) {
-        y1 = (int32_t)img->height;
-    }
-    if (x1 <= x0 || y1 <= y0) {
+    Rectangle clamped;
+    if (!cv_clamp_roi(roi, img->width, img->height, &clamped)) {
         return EMBEDDIP_ERROR_INVALID_SIZE;
     }
+    int32_t x0 = clamped.x;
+    int32_t y0 = clamped.y;
+    int32_t x1 = clamped.x + clamped.width;
+    int32_t y1 = clamped.y + clamped.height;
 
     uint32_t nbins = is_gray ? CV_HIST_GRAY_BINS : CV_HIST_COLOR_BINS;
     memset(out, 0, nbins * sizeof(float));

@@ -3,16 +3,13 @@
 
 #include "cv/tracker_particle.h"
 
-#include <stdint.h>
-#include <string.h>
-
 #include "core/memory_manager.h"
 #include "imgproc/filter.h"
 
-static bool particle_format_ok(ImageFormat fmt)
-{
-    return fmt == IMAGE_FORMAT_GRAYSCALE || fmt == IMAGE_FORMAT_MASK;
-}
+#include <stdint.h>
+#include <string.h>
+
+#include "cv/image_gray.h"
 
 /* xorshift32: fast, deterministic, no external RNG dependency. */
 static uint32_t xorshift32(uint32_t *state)
@@ -38,8 +35,10 @@ static float xorshift_range(uint32_t *state, float range)
     return (xorshift_unit(state) * 2.0f - 1.0f) * range;
 }
 
-embeddip_status_t cv_particle_init(CvParticleState *state, uint16_t particle_count,
-                                   float *particle_buffer, Rectangle roi)
+embeddip_status_t cv_particle_init(CvParticleState *state,
+                                   uint16_t particle_count,
+                                   float *particle_buffer,
+                                   Rectangle roi)
 {
     if (state == NULL || particle_buffer == NULL) {
         return EMBEDDIP_ERROR_NULL_PTR;
@@ -69,8 +68,10 @@ embeddip_status_t cv_particle_init(CvParticleState *state, uint16_t particle_cou
     return EMBEDDIP_OK;
 }
 
-embeddip_status_t cv_particle_init_hist(CvParticleState *state, uint16_t particle_count,
-                                        float *particle_buffer, const ImageView *frame,
+embeddip_status_t cv_particle_init_hist(CvParticleState *state,
+                                        uint16_t particle_count,
+                                        float *particle_buffer,
+                                        const ImageView *frame,
                                         Rectangle roi)
 {
     if (frame == NULL) {
@@ -136,8 +137,8 @@ static void particle_free_image_chals(Image *img)
  * No heap: the candidate histogram and the weight/resample scratch below
  * are stack arrays bounded by CV_PARTICLE_MAX_COUNT (validated at
  * cv_particle_init_hist), independent of the caller's particle_buffer. */
-static embeddip_status_t cv_particle_update_hist(CvParticleState *state, const ImageView *frame,
-                                                  Rectangle *out_box)
+static embeddip_status_t
+cv_particle_update_hist(CvParticleState *state, const ImageView *frame, Rectangle *out_box)
 {
     uint16_t count = state->particle_count;
     float weights[CV_PARTICLE_MAX_COUNT];
@@ -147,28 +148,19 @@ static embeddip_status_t cv_particle_update_hist(CvParticleState *state, const I
         float px = state->particle_buffer[i * 2u];
         float py = state->particle_buffer[i * 2u + 1u];
 
-        int32_t cand_x = (int32_t)px - state->box_width / 2;
-        int32_t cand_y = (int32_t)py - state->box_height / 2;
-        if (cand_x + state->box_width > (int32_t)frame->width) {
-            cand_x = (int32_t)frame->width - state->box_width;
-        }
-        if (cand_x < 0) {
-            cand_x = 0;
-        }
-        if (cand_y + state->box_height > (int32_t)frame->height) {
-            cand_y = (int32_t)frame->height - state->box_height;
-        }
-        if (cand_y < 0) {
-            cand_y = 0;
-        }
-        Rectangle cand_roi = {cand_x, cand_y, state->box_width, state->box_height};
+        Rectangle cand_roi = cv_clamp_centered_box((int32_t)px,
+                                                   (int32_t)py,
+                                                   state->box_width,
+                                                   state->box_height,
+                                                   frame->width,
+                                                   frame->height);
 
         float cand_hist[CV_HIST_MAX_BINS];
         uint32_t cand_nbins = 0u;
         float weight = 0.0f;
         if (cv_hist_build(frame, cand_roi, cand_hist, &cand_nbins) == EMBEDDIP_OK) {
-            weight = cv_hist_bhattacharyya(cand_hist, state->template_hist, state->hist_nbins) +
-                     1e-6f;
+            weight =
+                cv_hist_bhattacharyya(cand_hist, state->template_hist, state->hist_nbins) + 1e-6f;
         }
         weights[i] = weight;
         sum_w += weight;
@@ -212,8 +204,8 @@ static embeddip_status_t cv_particle_update_hist(CvParticleState *state, const I
     return EMBEDDIP_OK;
 }
 
-embeddip_status_t cv_particle_update(CvParticleState *state, const ImageView *frame,
-                                     Rectangle *out_box)
+embeddip_status_t
+cv_particle_update(CvParticleState *state, const ImageView *frame, Rectangle *out_box)
 {
     if (state == NULL || frame == NULL || out_box == NULL || frame->pixels == NULL) {
         return EMBEDDIP_ERROR_NULL_PTR;
@@ -222,8 +214,8 @@ embeddip_status_t cv_particle_update(CvParticleState *state, const ImageView *fr
         return EMBEDDIP_ERROR_NOT_INITIALIZED;
     }
     bool hist_mode = state->hist_nbins > 0u;
-    bool fmt_ok = particle_format_ok(frame->format) ||
-                  (hist_mode && frame->format == IMAGE_FORMAT_RGB565);
+    bool fmt_ok =
+        hist_mode ? cv_format_is_gray_or_rgb565(frame->format) : cv_format_is_gray(frame->format);
     if (!fmt_ok) {
         return EMBEDDIP_ERROR_INVALID_FORMAT;
     }
@@ -254,10 +246,15 @@ embeddip_status_t cv_particle_update(CvParticleState *state, const ImageView *fr
      * ->chals->ch[0], not ->pixels. Each call's allocation is freed below
      * once the magnitude values have been consumed, to avoid a per-frame
      * leak. */
-    Image gx_img = {.width = frame->width, .height = frame->height, .pixels = NULL,
-                    .chals = NULL, .size = frame->width * frame->height,
-                    .format = IMAGE_FORMAT_GRAYSCALE, .depth = IMAGE_DEPTH_F32,
-                    .log = IMAGE_DATA_PIXELS, .is_chals = false};
+    Image gx_img = {.width = frame->width,
+                    .height = frame->height,
+                    .pixels = NULL,
+                    .chals = NULL,
+                    .size = frame->width * frame->height,
+                    .format = IMAGE_FORMAT_GRAYSCALE,
+                    .depth = IMAGE_DEPTH_F32,
+                    .log = IMAGE_DATA_PIXELS,
+                    .is_chals = false};
     Image gy_img = gx_img;
     Image mag_img = gx_img;
 

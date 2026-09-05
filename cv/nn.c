@@ -12,7 +12,6 @@
 embeddip_status_t cv_nn_image_to_tensor(const ImageView *src, cv_tensor_t *dst)
 {
     embeddip_status_t status;
-    size_t count;
     size_t i;
     uint32_t y;
 
@@ -29,12 +28,9 @@ embeddip_status_t cv_nn_image_to_tensor(const ImageView *src, cv_tensor_t *dst)
     if ((uint32_t)dst->width != src->width || (uint32_t)dst->height != src->height) {
         return EMBEDDIP_ERROR_INVALID_SIZE;
     }
-    if ((dst->type == CV_TENSOR_I8 || dst->type == CV_TENSOR_U8) &&
-        !(dst->scale > 0.0f)) {
+    if ((dst->type == CV_TENSOR_I8 || dst->type == CV_TENSOR_U8) && !(dst->scale > 0.0f)) {
         return EMBEDDIP_ERROR_INVALID_ARG;
     }
-
-    count = (size_t)src->width * (size_t)src->height;
 
     i = 0u;
     for (y = 0u; y < src->height; ++y) {
@@ -83,12 +79,11 @@ embeddip_status_t cv_nn_image_to_tensor(const ImageView *src, cv_tensor_t *dst)
         }
     }
 
-    (void)count;
     return EMBEDDIP_OK;
 }
 
-embeddip_status_t cv_nn_argmax(const float *scores, size_t count, size_t *out_index,
-                               float *out_value)
+embeddip_status_t
+cv_nn_argmax(const float *scores, size_t count, size_t *out_index, float *out_value)
 {
     size_t best = 0u;
     size_t i;
@@ -147,8 +142,8 @@ embeddip_status_t cv_nn_softmax(float *logits, size_t count)
     return EMBEDDIP_OK;
 }
 
-embeddip_status_t cv_nn_segmentation_argmax(const cv_tensor_t *output,
-                                            uint8_t *class_map, size_t capacity)
+embeddip_status_t
+cv_nn_segmentation_argmax(const cv_tensor_t *output, uint8_t *class_map, size_t capacity)
 {
     size_t pixels;
     size_t channels;
@@ -205,9 +200,12 @@ embeddip_status_t cv_nn_segmentation_argmax(const cv_tensor_t *output,
     return EMBEDDIP_OK;
 }
 
-embeddip_status_t cv_nn_colorize(const uint8_t *class_map, uint32_t width,
-                                 uint32_t height, const uint8_t *palette,
-                                 size_t palette_count, uint8_t *rgb,
+embeddip_status_t cv_nn_colorize(const uint8_t *class_map,
+                                 uint32_t width,
+                                 uint32_t height,
+                                 const uint8_t *palette,
+                                 size_t palette_count,
+                                 uint8_t *rgb,
                                  size_t rgb_capacity)
 {
     size_t pixels;
