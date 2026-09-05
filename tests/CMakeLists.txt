@@ -46,6 +46,10 @@ add_executable(embeddip_test_cv_tracker_template test_cv_tracker_template.c)
 target_link_libraries(embeddip_test_cv_tracker_template PRIVATE embedDIP)
 add_test(NAME embeddip.cv_tracker_template COMMAND embeddip_test_cv_tracker_template)
 
+add_executable(embeddip_test_cv_track_hist test_cv_track_hist.c)
+target_link_libraries(embeddip_test_cv_track_hist PRIVATE embedDIP)
+add_test(NAME embeddip.cv_track_hist COMMAND embeddip_test_cv_track_hist)
+
 add_executable(embeddip_test_runtime test_runtime.c)
 target_link_libraries(embeddip_test_runtime PRIVATE embedDIP)
 add_test(NAME embeddip.runtime COMMAND embeddip_test_runtime)
