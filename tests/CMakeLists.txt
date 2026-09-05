@@ -50,6 +50,10 @@ add_executable(embeddip_test_cv_track_hist test_cv_track_hist.c)
 target_link_libraries(embeddip_test_cv_track_hist PRIVATE embedDIP)
 add_test(NAME embeddip.cv_track_hist COMMAND embeddip_test_cv_track_hist)
 
+add_executable(embeddip_test_cv_tracker_particle test_cv_tracker_particle.c)
+target_link_libraries(embeddip_test_cv_tracker_particle PRIVATE embedDIP)
+add_test(NAME embeddip.cv_tracker_particle COMMAND embeddip_test_cv_tracker_particle)
+
 add_executable(embeddip_test_runtime test_runtime.c)
 target_link_libraries(embeddip_test_runtime PRIVATE embedDIP)
 add_test(NAME embeddip.runtime COMMAND embeddip_test_runtime)
